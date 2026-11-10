@@ -14,8 +14,8 @@
 ## 每次發版
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag v0.2.0
+git push origin v0.2.0
 ```
 
 推 tag 會觸發 `.github/workflows/release.yml`：
@@ -36,3 +36,5 @@ git push origin v0.1.0
 ## 手動備案
 
 CI 不能用時，`scripts/bump-version.sh X.Y.Z --push` 會在本機改版本號、commit、打 tag、push。
+
+> 本機保留了上游 GrokSearch-rs 的 tag（v0.1.0～v0.1.26），不要推到 GitHub；新版本從 v0.2.0 起算，避開這些名稱。
