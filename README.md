@@ -1,364 +1,170 @@
-# GrokSearch-rs
+# llm-search
 
-![GrokSearch-rs product banner](assets/groksearch-rs-banner.png)
+給 AI coding agent（Claude Code、Codex 等）用的網路搜尋 MCP server，以 Rust 撰寫。
 
-**A lightweight Rust MCP server for Grok / OpenAI‑compatible web search, backed by an ordered source chain — Tavily, Exa, TinyFish, Firecrawl — for supplemental sources, fetch, and map.**
+- **搜尋**：預設用 Brave + Tavily 路由，依 `mode` 決定先用哪家、要不要兩家並行。也可以切回 Grok 寫答案的模式。
+- **抓網頁**：GitHub / StackExchange / arXiv / Wikipedia 用專門解析器（不需要 key），其他網頁走 Tavily → Exa → TinyFish → Firecrawl。
+- **可追溯**：每筆結果都帶 `source_log`（`src_001` 編號）；抓網頁附 `content_hash`（SHA-256）和 `extracted_at`；改用備援服務時回傳 `fallbacks` 和 `notice`。
 
-`grok-search-rs` is an **MCP server** — run it locally over **stdio** (your client launches it; you do not run it directly) or as a **remote Streamable HTTP** service for mobile / multi‑device access (see [self-hosting](#self-hosting-remote-http)). It exposes one set of tools (`web_search`, `get_sources`, `web_fetch`, `web_map`, `doctor`) and supports two upstream transports so you can plug into either xAI's official API or any OpenAI‑compatible relay.
-
----
-
-## Features
-
-- 🔎 **Live web search** with cited sources, cached for follow‑up `get_sources` calls. Opt‑in `include_content` enriches the top sources with full extracted text in one call.
-- 📏 **Response budgeting** — `web_search` keeps responses inside agent context limits: only the top `max_inline_sources` carry inline text, a whole‑response char budget (`response_max_chars`, default 45k — sized to stay under the MCP client token ceiling after JSON serialization) trims tail sources with recovery notes, `response_format: "concise" | "detailed"` picks the payload size, and `get_sources` pages through cached sources with `offset`/`limit`. The session cache always keeps full content.
-- 🧩 **Structured `web_fetch`** — GitHub issues/PRs/releases, StackExchange/MathOverflow, arXiv, and Wikipedia URLs are parsed by specialist extractors into clean Markdown (title, state/labels, release notes, accepted‑answer ordering, abstracts, vote‑sorted answers). **Specialist extractors need no API key.** Anything else falls back to the generic source chain (Tavily → Exa → TinyFish → Firecrawl, as configured) — so with **no source provider configured, ordinary URLs cannot be fetched at all**, only the specialist families above. Output carries `source_type` and a `fallback_reason` when a specialist was skipped.
-- 🔀 **Two transports** — native xAI Responses (`/v1/responses`) **or** any OpenAI‑compatible chat‑completions gateway (`/v1/chat/completions`). Pick by env vars; no flag.
-- 🔐 **Optional Grok OAuth mode** — `login/status/logout` commands store a local xAI OAuth token for Responses auth, so the MCP server can run without `GROK_SEARCH_API_KEY`.
-- 🌐 **Optional remote mode** — build with `--features http` to serve the same tools over **Streamable HTTP** (multi‑tenant, bring‑your‑own‑key via request headers) for mobile / multi‑device access. See [self-hosting](#self-hosting-remote-http).
-- 📥 **Pluggable source chain** — supplemental sources and generic fetch walk an ordered provider chain: **Tavily** (RAG‑tuned search + extract + map), **Exa** (semantic search, native domain/date filters), **TinyFish** (free search + JS‑rendering fetch), **Firecrawl** (robust scrape fallback). First provider with results wins; `GROK_SEARCH_SOURCE_PROVIDERS` reorders. `TAVILY_API_KEY` accepts a comma‑separated key list — keys rotate round‑robin with automatic failover on rate/quota errors.
-- 🐦 **Optional X/Twitter search** via `x_search` (Responses transport only).
-- 🚦 **Concurrent stdio requests** — up to 8 tool calls are handled at once; anything beyond that queues rather than being refused. Responses come back in completion order, paired to requests by JSON‑RPC `id`.
-- 🩺 **`doctor`** — connectivity probe + redacted config in one tool call, including whether your config file was found, loaded, or rejected (and why).
-- 🗂 **Single global config file** so multiple MCP clients share one set of keys.
+本專案 fork 自 [GrokSearch-rs](https://github.com/Episkey-G/GrokSearch-rs)，並移植了 [deepseek-harness-web-search-plugin](https://github.com/cloveric/deepseek-harness-web-search-plugin) 的搜尋路由與來源追蹤設計。詳見[致謝](#致謝)。
 
 ---
 
-## Install
+## 工具
 
-```bash
-npm install -g grok-search-rs
-```
-
-The npm package ships a native Rust binary; the `grok-search-rs` command is what your MCP client launches.
-
----
-
-## Quick Start
-
-**Option A — use the hosted instance (no install).** Point any MCP client that supports remote
-HTTP + custom headers at the public endpoint and pass your own keys as headers:
-
-```bash
-claude mcp add --transport http grok-search https://mcp.episkeyai.com/groksearch_rs/mcp \
-  --header "X-Grok-Api-Key: xai-..." \
-  --header "X-Tavily-Api-Key: tvly-..."
-```
-
-The default gateway is xAI official (`api.x.ai`) — use an xAI key. For any other Grok‑compatible
-gateway, add `--header "X-Grok-Base-Url: https://your-gateway.example/v1"` with a matching key, and
-optionally `--header "X-Grok-Model: <model>"` (model ids are gateway‑specific). No keys are stored
-server-side; best-effort availability. Prefer your own server? See [self-hosting](#self-hosting-remote-http).
-
-**Option B — install locally (stdio).**
-
-1. After `npm install -g grok-search-rs`, add this MCP server entry to your client config:
-
-   ```json
-   {
-     "grok-search-rs": {
-       "command": "grok-search-rs",
-       "args": [],
-       "env": {
-         "GROK_SEARCH_API_KEY": "",
-         "GROK_SEARCH_URL": "",
-         "GROK_SEARCH_MODEL": "grok-4.20-fast",
-         "TAVILY_API_KEY": "",
-         "TAVILY_API_URL": "https://api.tavily.com",
-         "FIRECRAWL_API_KEY": ""
-       }
-     }
-   }
-   ```
-
-   For Codex TOML config:
-
-   ```toml
-   [mcp_servers.grok-search-rs]
-   type = "stdio"
-   command = "grok-search-rs"
-
-   [mcp_servers.grok-search-rs.env]
-   FIRECRAWL_API_KEY = ""
-   GROK_SEARCH_API_KEY = ""
-   GROK_SEARCH_MODEL = "grok-4.20-fast"
-   GROK_SEARCH_URL = ""
-   TAVILY_API_KEY = ""
-   TAVILY_API_URL = "https://api.tavily.com"
-   ```
-
-   Put your real keys in the empty values. If your client expects a top-level `mcpServers` / `mcp_servers` object, place the `grok-search-rs` entry under that section.
-
-2. Optional: scaffold a shared global config file instead of duplicating env blocks in every MCP client:
-
-   ```bash
-   grok-search-rs --init
-   $EDITOR ~/.config/grok-search-rs/config.toml
-   ```
-
-3. Verify:
-
-   ```text
-   Ask your assistant: "call doctor"
-   ```
-
-   Successful output shows `reachable: true` for each enabled upstream and `transport: Responses` (or `ChatCompletions`).
-
----
-
-## Configuration
-
-The MCP **transport** decides how config reaches the server — same values, different channel (forced by the transport, not a project setting):
-
-- **stdio (local):** environment variables — the `env` block in your MCP client config.
-- **remote HTTP:** per-request HTTP headers — the server stores no keys.
-
-| Setting | stdio env | remote header |
-|---|---|---|
-| Grok API key | `GROK_SEARCH_API_KEY` | `X-Grok-Api-Key` |
-| Grok gateway URL | `GROK_SEARCH_URL` | `X-Grok-Base-Url` |
-| Grok model | `GROK_SEARCH_MODEL` | `X-Grok-Model` |
-| Tavily API key | `TAVILY_API_KEY` | `X-Tavily-Api-Key` |
-| Firecrawl API key | `FIRECRAWL_API_KEY` | `X-Firecrawl-Api-Key` |
-| TinyFish API key | `TINYFISH_API_KEY` | `X-Tinyfish-Api-Key` |
-| Exa API key | `EXA_API_KEY` | `X-Exa-Api-Key` |
-| GitHub token | `GITHUB_TOKEN` | `X-GitHub-Token` |
-
-The tables below use env-key names (they also drive `config.toml` / stdio); on the remote transport send the header from the row above. Full reference and per-transport examples: [docs/CONFIGURATION.md](docs/CONFIGURATION.md#configuration-channels-stdio-env-vs-remote-headers). All source-provider keys (Tavily / Exa / TinyFish / Firecrawl) are shared across transports.
-
-### A. Native Grok Responses (default)
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `GROK_SEARCH_AUTH_MODE` | `api_key` | `api_key` uses `GROK_SEARCH_API_KEY`; `oauth` uses the local token from `grok-search-rs login`. |
-| `GROK_SEARCH_API_KEY` | — *(required in `api_key` mode)* | Bearer token for the Grok / xAI gateway. |
-| `GROK_SEARCH_AUTH_FILE` | `<home>/.config/grok-search-rs/auth.json` | Optional OAuth token file override. |
-| `GROK_SEARCH_URL` | `https://api.x.ai` | Root, `/v1`, or full‑endpoint URL. |
-| `GROK_SEARCH_MODEL` | `grok-4-1-fast-reasoning` | Model name. |
-| `GROK_SEARCH_WEB_SEARCH` | `true` | Offer `web_search` tool to Grok. |
-| `GROK_SEARCH_X_SEARCH` | `false` | Offer `x_search` tool (X/Twitter) to Grok. |
-
-Verified upstream: **xAI** (`https://api.x.ai`, both tools). Other Grok‑compatible gateways work with a matching key; `x_search` availability depends on the gateway.
-
-OAuth mode is a single-binary flow:
-
-```bash
-grok-search-rs login
-grok-search-rs status
-grok-search-rs logout
-```
-
-Then configure your MCP client with:
-
-```toml
-[mcp_servers.grok-search-rs]
-command = "grok-search-rs"
-
-[mcp_servers.grok-search-rs.env]
-GROK_SEARCH_AUTH_MODE = "oauth"
-GROK_SEARCH_MODEL = "grok-4.3"
-GROK_SEARCH_WEB_SEARCH = "true"
-```
-
-OAuth mode reuses Hermes' xAI OAuth client id and stores `auth.json` locally. That may violate xAI terms or affect your account; do not share the token file. If xAI changes or blocks that OAuth flow, switch back to `api_key` mode.
-
-### B. OpenAI‑compatible chat/completions
-
-Activate by setting the URL **and** key while leaving `GROK_SEARCH_API_KEY` unset. Suitable for any OpenAI‑compatible relay (one‑api, vLLM, LiteLLM, marybrown, Perplexity‑style gateways, etc.).
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `OPENAI_COMPATIBLE_API_URL` | — | Root, `/v1`, or full‑endpoint URL. |
-| `OPENAI_COMPATIBLE_API_KEY` | — | Bearer token for the relay. |
-| `OPENAI_COMPATIBLE_MODEL` | falls back to `GROK_SEARCH_MODEL` | Model name to send. |
-
-Notes:
-
-- `GROK_SEARCH_WEB_SEARCH=true` (default) appends `tools:[{"type":"web_search"}]` to the payload. Relays that auto‑search server‑side simply ignore it.
-- `GROK_SEARCH_X_SEARCH=true` is **silently ignored** on this transport (a one‑line stderr warning prints at startup). `x_search` only exists on the Responses API.
-- Source extraction reads four parallel paths and de‑duplicates by URL: OpenAI `annotations[].url_citation`, Perplexity‑style `citations`, top‑level `search_sources[]`, and inline `[[n]](url)` markers.
-
-### Source providers (shared)
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `TAVILY_API_KEY` | — *(required for `web_map`)* | Tavily key. Comma‑separated list rotates round‑robin with failover on HTTP 401/403/429/432/433. |
-| `TAVILY_API_URL` | `https://api.tavily.com` | Tavily base. |
-| `GROK_SEARCH_EXTRA_SOURCES` | `3` | Extra chain‑served sources after a Grok answer (`0` disables). |
-| `GROK_SEARCH_FALLBACK_SOURCES` | `5` | Fallback source count when the AI step can't verify itself. |
-| `FIRECRAWL_API_KEY` | unset | Enables Firecrawl as `web_fetch` / source fallback. |
-| `FIRECRAWL_API_URL` | `https://api.firecrawl.dev` | Firecrawl base; defaults to `/v2`, preserving explicit `/v1` or `/v2` and gateway prefixes. |
-| `TINYFISH_API_KEY` | unset | Enables TinyFish (free search + JS‑rendering fetch) in the chain. |
-| `EXA_API_KEY` | unset | Enables Exa (semantic search, native filters) in the chain. |
-| `GROK_SEARCH_SOURCE_PROVIDERS` | unset | Explicit chain order, e.g. `tinyfish,tavily,firecrawl`. Unset = canonical order `tavily, exa, tinyfish, firecrawl` over configured providers. |
-| `GROK_SEARCH_CACHE_SIZE` | `256` | Max cached `web_search` sessions. |
-| `GROK_SEARCH_TIMEOUT_SECONDS` | `60` | HTTP timeout for all upstreams. |
-| `GROK_SEARCH_FETCH_MAX_CHARS` | unset | Default char cap on `web_fetch`. |
-| `GROK_SEARCH_MAX_INLINE_SOURCES` | `5` | Max `web_search` sources carrying inline content; the rest are metadata‑only. |
-| `GROK_SEARCH_RESPONSE_MAX_CHARS` | `45000` | Whole‑response char budget for `web_search`; over‑budget output is truncated tail‑first with `truncated: true`. Sized to keep the serialized result under the MCP client token ceiling (Claude Code default `MAX_MCP_OUTPUT_TOKENS=25000`). |
-
-### Source extraction (`web_fetch` specialists / `web_search` enrichment)
-
-| Variable | Default | Purpose |
-|---|---|---|
-| `GITHUB_TOKEN` | unset | Authenticates GitHub issue/PR/release fetches (higher API rate limit; private repos). Specialist works unauthenticated but is rate‑limited. |
-| `GROK_SEARCH_SOURCE_MAX_ANSWERS` | `5` | StackExchange answers rendered before folding. |
-| `GROK_SEARCH_SOURCE_MAX_COMMENTS` | `30` | GitHub / StackExchange comments rendered before folding. |
-| `GROK_SEARCH_ENRICH_CONCURRENCY` | `3` | Parallel source enrichments for `web_search` `include_content` (clamped 1..5). |
-| `GROK_SEARCH_ENRICH_MAX_CHARS` | `15000` | Char cap per enriched source body. |
-
-These specialists need **no Tavily/Firecrawl key** — they hit the public GitHub,
-StackExchange, arXiv, and Wikipedia APIs directly. Tavily/Firecrawl are only used
-for the generic fallback path.
-
-### Selection rules at startup
-
-1. If `GROK_SEARCH_AUTH_MODE=oauth` → **Responses** transport with the local OAuth token.
-2. Else if `GROK_SEARCH_API_KEY` is set → **Responses** transport with a static Bearer key.
-3. Else if both `OPENAI_COMPATIBLE_API_URL` and `OPENAI_COMPATIBLE_API_KEY` are set → **ChatCompletions** transport.
-4. Else → server fails with a clear `MissingConfig` error.
-
-### Global config file
-
-Tired of duplicating `env` blocks across clients? Run `grok-search-rs --init` once to scaffold `<home>/.config/grok-search-rs/config.toml`, fill in your keys, and every client can shrink to `{"command": "grok-search-rs"}`.
-
-| Path order | Location |
+| 工具 | 用途 |
 |---|---|
-| 1 | `$GROK_SEARCH_CONFIG` (explicit override, any platform) |
-| 2 | `$HOME/.config/grok-search-rs/config.toml` (Unix / macOS / Git Bash) |
-| 3 | `%USERPROFILE%\.config\grok-search-rs\config.toml` (native Windows) |
+| `web_search` | 搜尋網路。`mode`、`max_results`、`recency_days`、`include_domains`、`exclude_domains` 控制範圍 |
+| `get_sources` | 取回上一次 `web_search` 快取的來源，不重新搜尋，可用 `offset` / `limit` 分頁 |
+| `web_fetch` | 讀網頁全文。`url` 一頁或 `urls` 最多 10 頁；`depth`（basic / advanced）、`format`（markdown / text）、`max_chars` |
+| `web_map` | 列出網站底下的網址（Tavily Map） |
+| `provider_status` | 只檢查設定、不打 API、不扣額度：哪些服務已設定、目前引擎、各工具的服務順序 |
+| `doctor` | 實際呼叫各服務檢查連線，回報 ok / not_configured / auth_error / rate_limited / timeout / error。會扣少量額度，`provider` 可只測一家 |
 
-**Precedence**: per‑client `env` **>** config file **>** built‑in defaults. File keys are lowercase `snake_case` (env `GROK_SEARCH_MODEL` → file `grok_model`). Unknown keys are rejected. Full reference: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+所有回傳內容與錯誤訊息都會遮蔽 API key。
+
+### `web_search` 模式（引擎 `brave`）
+
+| `mode` | 流程 | 適合 |
+|---|---|---|
+| `quick`（預設） | Brave → 失敗才用 Tavily | 一般查詢、找文件、新聞 |
+| `deep` | Tavily advanced（附簡短答案與每筆最多 6,000 字網頁內容）→ 失敗才用 Brave | 研究、需要網頁內容 |
+| `verify` | Brave 與 Tavily 並行，合併去重 | 重要或有爭議的說法（兩家都扣額度） |
+
+`max_results` 1–10，預設 5。Brave 與 Tavily 都失敗時，依序改用 Exa → TinyFish → Firecrawl。
+
+### `web_fetch` 抓取順序
+
+1. GitHub issue / PR / release、StackExchange、arXiv、Wikipedia：專門解析器，輸出結構化 Markdown。
+2. 其他網址：Tavily Extract → Exa → TinyFish → Firecrawl，第一個有內容的勝出。Tavily 用預設深度抓到空內容時（多半是用 JavaScript 產生內容的網頁），會自動改用 `advanced` 重抓一次。
+3. Brave 只能搜尋，不參與抓網頁。
 
 ---
 
-## MCP Tools
+## 安裝
 
-| Tool | When to call it |
-|---|---|
-| `web_search` | Sourced summary for a topic. Sources cached for follow‑up. `response_format: "concise"` returns answer + metadata only; `"detailed"` inlines source text within the response budget. |
-| `get_sources` | Re‑fetch sources of a previous `web_search` by `session_id`. Supports `offset` / `limit` pagination for large source sets. |
-| `web_fetch` | Page content as clean Markdown. Key‑free specialist extractors for GitHub / StackExchange / arXiv / Wikipedia; every other URL goes through the source chain, which needs at least one provider key. Returns `source_type` + `fallback_reason`. |
-| `web_map` | Discover URLs on a domain via Tavily Map. |
-| `doctor` | Live connectivity probe + redacted config, plus the config file's path and whether it was `absent` / `loaded` / `rejected`. Run first when something looks off. |
-
----
-
-## Self-hosting (remote HTTP)
-
-Besides the default stdio mode, `grok-search-rs` can run as a **remote, multi‑tenant
-Streamable HTTP MCP server** so mobile / on‑the‑go / multi‑device clients can reach it over
-the network. It is **opt‑in behind the `http` Cargo feature** — the default build is
-unchanged (pure stdio, no HTTP dependencies linked in).
-
-**Bring‑your‑own‑key, zero shared credentials.** The server stores no API keys. Each
-request carries the caller's own keys as headers, so many users can share one endpoint and
-each pays with their own keys:
-
-- `X-Grok-Api-Key`, `X-Tavily-Api-Key`, `X-Firecrawl-Api-Key` (optional `X-GitHub-Token`)
-- Optional non‑secret overrides: `X-Grok-Base-Url` (gateway), `X-Grok-Model` (model name, since model ids are gateway‑specific)
-
-This cuts both ways: setting `TAVILY_API_KEY` / `FIRECRAWL_API_KEY` in the **server's** own
-environment (compose file, `.env`, systemd unit) has no effect — those are stripped from every
-per‑request config, so requests that don't carry the header run with no source fallback at all.
-The server logs a warning at startup for each such variable it finds.
-
-A missing required key returns `401` (fail‑closed); OAuth is rejected on this transport
-(stdio only). The operator sets the default Grok‑compatible gateway via `GROK_SEARCH_URL`
-(default `https://api.x.ai`), and callers may point at any other Grok‑compatible gateway with an
-`X-Grok-Base-Url` header (any public gateway is honored; internal/private addresses are rejected).
-The remote transport uses the Grok **Responses** API only; the OpenAI-compatible chat-completions transport is stdio-only.
-
-**No local build needed.** Every release ships ready‑to‑run server artifacts for Linux
-`x86_64` + `aarch64` (static musl) — ideal for low‑RAM/small‑disk boards where a native
-`cargo build` would OOM or fill the disk:
-
-- **Prebuilt binary** — download `grok-search-rs-http_Linux_<arch>.tar.gz` from the
-  [latest release](https://github.com/Episkey-G/GrokSearch-rs/releases/latest) and run
-  `GROK_MCP_BIND=0.0.0.0:8080 ./grok-search-rs --http`. (The plain `grok-search-rs_…`
-  assets are **stdio‑only**: the HTTP transport is compile‑time gated and not in them.)
-- **Docker image** — multi‑arch `amd64`/`arm64`:
-  `docker pull ghcr.io/episkey-g/grok-search-rs:latest` (serves on `:8080`).
-
-Building from source instead:
+需要 Rust 1.78 以上。
 
 ```bash
-cargo build --profile release-http --features http    # release-http => panic=unwind (handler panic won't kill the server)
-GROK_MCP_BIND=127.0.0.1:8080 target/release-http/grok-search-rs --http   # bind loopback; terminate TLS upstream
-```
-
-Put a TLS‑terminating reverse proxy (e.g. Caddy) in front. The repo ships a `Dockerfile`,
-`Dockerfile.deploy` (runtime‑only, multi‑arch `amd64`/`arm64` — cross‑compile the binaries
-first with `scripts/build-deploy-dist.sh`; ideal for low‑RAM hosts), `docker-compose.yml`, and `Caddyfile`
-for a one‑command deploy with automatic HTTPS. Set `MCP_HOSTNAME` (your domain or a
-`<dashed-ip>.sslip.io` name) via the environment or a git‑ignored `.env` — **not** in the
-repo.
-
-Connect a client the same way as the hosted instance ([Quick Start](#quick-start)), pointing
-`url` at your own host (`https://<your-host>/groksearch_rs/mcp`).
-
-### Rotating a key
-
-Keys are never stored server‑side, so rotation is entirely client‑side:
-
-- **stdio** — update the key in your MCP client's `env` block (or the global `config.toml`)
-  and restart the client.
-- **remote HTTP** — update the header value in your client config. For Claude Code:
-  ```bash
-  claude mcp remove grok-search -s user
-  claude mcp add --transport http grok-search https://<your-host>/groksearch_rs/mcp \
-    --header "X-Grok-Api-Key: <new-key>" --header "X-Tavily-Api-Key: <new-key>"
-  ```
-
-Rotate immediately if a key was ever printed, logged, or shared.
-
----
-
-## Build from source
-
-```bash
-git clone https://github.com/Episkey-G/GrokSearch-rs.git
-cd GrokSearch-rs
+cd llm-search
 cargo build --release
 ```
 
-The binary lands at `target/release/grok-search-rs`. Point your MCP client's `command` at the absolute path.
+執行檔在 `target/release/llm-search`。MCP client 的 `command` 指向它的絕對路徑。
+
+### 註冊到 Claude Code
+
+```bash
+claude mcp add llm-search -s user \
+  -e BRAVE_API_KEY=YOUR_BRAVE_KEY \
+  -e TAVILY_API_KEY=YOUR_TAVILY_KEY \
+  -- /absolute/path/to/llm-search/target/release/llm-search
+```
+
+註冊後設定存在 `~/.claude.json` 的 `mcpServers.llm-search.env`，可在那裡把佔位文字換成真的 key。開新 session 後先呼叫 `provider_status` 確認。
+
+### Codex（TOML）
+
+```toml
+[mcp_servers.llm-search]
+type = "stdio"
+command = "/absolute/path/to/llm-search/target/release/llm-search"
+
+[mcp_servers.llm-search.env]
+BRAVE_API_KEY = ""
+TAVILY_API_KEY = ""
+```
 
 ---
 
-## Development
+## 設定
+
+### 搜尋引擎
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `LLM_SEARCH_PROVIDER` | `brave` | `web_search` 的引擎。`brave` = Brave / Tavily 路由；`grok` = Grok 寫答案加來源（`mode` 會被忽略）。不認得的值會警告並使用 `brave` |
+| `BRAVE_API_KEY` | — | Brave Search API key（也接受 `BRAVE_SEARCH_API_KEY`） |
+| `BRAVE_API_URL` | `https://api.search.brave.com` | Brave API base |
+| `BRAVE_ENABLED` | `true` | 設 `false` 可停用 Brave |
+| `TAVILY_API_KEY` | — | Tavily key。逗號分隔多把 key 會輪流使用，遇到 401/403/429/432/433 自動換下一把 |
+| `TAVILY_API_URL` | `https://api.tavily.com` | Tavily API base |
+
+引擎 `brave` 至少需要 `BRAVE_API_KEY` 或 `TAVILY_API_KEY` 其中一把；`web_map` 需要 Tavily。
+
+### 其他來源服務（選用）
+
+| 變數 | 說明 |
+|---|---|
+| `EXA_API_KEY` | Exa（語意搜尋、原生日期與網域篩選） |
+| `TINYFISH_API_KEY` | TinyFish（搜尋 + 可執行 JavaScript 的抓取） |
+| `FIRECRAWL_API_KEY` / `FIRECRAWL_API_URL` | Firecrawl（抓網頁最後的備援） |
+| `GITHUB_TOKEN` | GitHub 解析器提高 API 額度、可讀私有 repo |
+
+### Grok 引擎（`LLM_SEARCH_PROVIDER=grok` 才需要）
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `GROK_SEARCH_API_KEY` | — | xAI / Grok 相容 gateway 的 key |
+| `GROK_SEARCH_URL` | `https://api.x.ai` | Gateway URL |
+| `GROK_SEARCH_MODEL` | `grok-4-1-fast-reasoning` | 模型 |
+| `OPENAI_COMPATIBLE_API_URL` / `OPENAI_COMPATIBLE_API_KEY` / `OPENAI_COMPATIBLE_MODEL` | — | 改用 OpenAI 相容的 chat/completions gateway（不設 `GROK_SEARCH_API_KEY` 時生效） |
+| `GROK_SEARCH_EXTRA_SOURCES` | `3` | Grok 答案之外另外補的來源數 |
+| `GROK_SEARCH_SOURCE_PROVIDERS` | 未設定 | 補來源的服務順序，預設 `tavily, exa, tinyfish, firecrawl, brave` |
+
+Grok 也支援 OAuth：`llm-search login` / `status` / `logout`，再設 `GROK_SEARCH_AUTH_MODE=oauth`。這個流程沿用上游的作法，可能違反 xAI 條款，使用前自行評估。
+
+### 回應大小與快取
+
+| 變數 | 預設 | 說明 |
+|---|---|---|
+| `GROK_SEARCH_RESPONSE_MAX_CHARS` | `45000` | `web_search` 整體回應字數上限，也是 `web_fetch` 多頁模式的共用上限 |
+| `GROK_SEARCH_FETCH_MAX_CHARS` | 未設定 | `web_fetch` 單頁字數上限 |
+| `GROK_SEARCH_MAX_INLINE_SOURCES` | `5` | 附網頁內容的來源數上限 |
+| `GROK_SEARCH_CACHE_SIZE` | `256` | 快取的搜尋 session 數 |
+| `GROK_SEARCH_TIMEOUT_SECONDS` | `60` | 所有上游的 HTTP 逾時 |
+| `GROK_SEARCH_ENRICH_CONCURRENCY` | `3` | 補抓網頁內容的並行數（1–5） |
+
+`GROK_SEARCH_*` 這組名稱沿用上游，暫未改名。完整清單見 [docs/CONFIGURATION.md](docs/CONFIGURATION.md)（該文件仍是上游內容，尚未加入 Brave 與路由設定）。
+
+### 共用設定檔
+
+`llm-search --init` 會產生 `~/.config/grok-search-rs/config.toml`，多個 MCP client 可共用一組 key。優先順序：client 的 `env` > 設定檔 > 內建預設。檔案內的 key 用小寫 snake_case（例如 `llm_search_provider`、`brave_api_key`），不認得的 key 會被拒絕。
+
+> 路徑與上游 GrokSearch-rs 相同。若同時安裝了 grok-search-rs，舊版不認得 `brave_api_key` 等新欄位，會拒絕整個設定檔，這種情況請改用 `env` 設定。
+
+---
+
+## 遠端 HTTP 模式（選用）
+
+```bash
+cargo build --profile release-http --features http
+GROK_MCP_BIND=127.0.0.1:8080 target/release-http/llm-search --http
+```
+
+伺服器不保存任何 key，每個請求用 header 帶自己的 key：`X-Brave-Api-Key`、`X-Tavily-Api-Key`、`X-Exa-Api-Key`、`X-Tinyfish-Api-Key`、`X-Firecrawl-Api-Key`、`X-Grok-Api-Key`、`X-GitHub-Token`。前面請放 TLS reverse proxy（repo 內附 `Caddyfile`、`docker-compose.yml`）。
+
+---
+
+## 開發
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
+cargo test --features http
 ```
 
-More docs:
-
-- [Configuration](docs/CONFIGURATION.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Testing](docs/TESTING.md)
+- [docs/llm-search-plan.md](docs/llm-search-plan.md)：本 fork 的實作計畫與功能對照
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)、[docs/TESTING.md](docs/TESTING.md)：上游文件
 
 ---
 
-## ⭐ Star History
+## 致謝
 
-<a href="https://www.star-history.com/?repos=Episkey-G%2FGrokSearch-rs&type=date&legend=top-left">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=Episkey-G/GrokSearch-rs&type=date&theme=dark&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=Episkey-G/GrokSearch-rs&type=date&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=Episkey-G/GrokSearch-rs&type=date&legend=top-left&sealed_token=azObTSBD9fgG_4eDHXglTgCUguLssOhllpL_T1u5KRiuxWgqipir_p_mWXlqjtX0NJ-_JtEURaaMBYOk3_VlEqmTQJvfn6jMGoiAEFU8wXeXZT4v_dWsZA" />
- </picture>
-</a>
-
----
-
-## Acknowledgements
-
-- Inspired by [GuDaStudio/GrokSearch](https://github.com/GuDaStudio/GrokSearch) — the original Python implementation that pioneered the Grok + Tavily + Firecrawl combo this project rewrites in Rust.
-- Thanks to the [LinuxDo](https://linux.do) community for the discussions, feedback, and the prior art that inspired this rewrite.
+- **[GrokSearch-rs](https://github.com/Episkey-G/GrokSearch-rs)**（MIT，© 2026 GrokSearch-rs contributors）：本專案的程式碼基底，fork 自 v0.1.26（commit `3245542`）。MCP 框架、來源服務鏈、專門解析器、回應預算、快取、HTTP 模式皆來自上游。
+- **[deepseek-harness-web-search-plugin](https://github.com/cloveric/deepseek-harness-web-search-plugin)**（MIT，© 2026 Cloveric）：Brave / Tavily 路由模式（quick / deep / verify）、備援揭露、`source_log`、`content_hash`、`provider_status`、金鑰遮蔽等設計參考此專案，以 Rust 重新實作，未複製其程式碼。
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — 見 [LICENSE](LICENSE)。
