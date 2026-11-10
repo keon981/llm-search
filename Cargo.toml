@@ -1,22 +1,22 @@
 [package]
-name = "grok-search-rs"
+name = "llm-search"
 version = "0.1.26"
 edition = "2021"
 rust-version = "1.78"
-description = "Rust MCP server for Grok web search and Tavily-backed source retrieval"
+description = "MCP server for Brave/Tavily-routed web search (Grok optional) with multi-provider page fetch; fork of GrokSearch-rs"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/Episkey-G/GrokSearch-rs"
 homepage = "https://github.com/Episkey-G/GrokSearch-rs"
-keywords = ["mcp", "grok", "tavily", "firecrawl", "search"]
+keywords = ["mcp", "brave", "tavily", "grok", "search"]
 categories = ["command-line-utilities", "web-programming"]
 
 [lib]
-name = "grok_search_rs"
+name = "llm_search"
 path = "src/lib.rs"
 
 [[bin]]
-name = "grok-search-rs"
+name = "llm-search"
 path = "src/main.rs"
 
 [dependencies]

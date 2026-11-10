@@ -1,5 +1,5 @@
-use grok_search_rs::model::search::SearchFilters;
-use grok_search_rs::providers::tinyfish::{
+use llm_search::model::search::SearchFilters;
+use llm_search::providers::tinyfish::{
     normalize_tinyfish_results, parse_tinyfish_fetch, tinyfish_search_params,
 };
 use serde_json::json;

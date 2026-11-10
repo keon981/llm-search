@@ -1,6 +1,15 @@
 use crate::error::{GrokSearchError, Result};
+use crate::model::search::{ExtractFormat, FetchOptions, SearchDepth};
 use crate::model::tool::WebSearchInput;
+use crate::redact::{redact_text, redact_value};
 use crate::service::SearchService;
+
+/// Appended to `web_search` failures, as in the DeepSeek plugin: the calling
+/// agent still has its own search tool and should say this one failed.
+const NATIVE_SEARCH_FALLBACK_HINT: &str = "If llm-search keeps failing, fall back to the client's built-in web search (Claude Code: WebSearch) and tell the user that the llm-search MCP failed.";
+
+/// Most URLs one `web_fetch` call accepts through `urls`.
+const MAX_FETCH_URLS: usize = 10;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::task::JoinSet;
@@ -120,7 +129,8 @@ pub(crate) async fn handle_message(service: &SearchService, request: Value) -> O
             .await
             .unwrap_or_else(|err| {
                 let code = err.code() as i64;
-                error_response(id, code, err.to_string())
+                let message = redact_text(&err.to_string(), &service.secret_values());
+                error_response(id, code, message)
             }),
     )
 }
@@ -146,7 +156,7 @@ async fn handle_request(service: &SearchService, request: Value) -> Result<Value
                 json!({
                     "protocolVersion": negotiate_protocol_version(requested),
                     "serverInfo": {
-                        "name": "grok-search-rs",
+                        "name": "llm-search",
                         "version": env!("CARGO_PKG_VERSION")
                     },
                     "capabilities": {
@@ -167,7 +177,10 @@ async fn handle_request(service: &SearchService, request: Value) -> Result<Value
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let result = call_tool(service, name, args).await?;
+            let result = redact_value(
+                call_tool(service, name, args).await?,
+                &service.secret_values(),
+            );
             Ok(success_response(
                 id,
                 json!({
@@ -189,7 +202,11 @@ async fn handle_request(service: &SearchService, request: Value) -> Result<Value
 
 async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<Value> {
     match name {
-        "doctor" => Ok(service.doctor().await),
+        "doctor" => {
+            let provider = args.get("provider").and_then(Value::as_str);
+            service.doctor_scoped(provider).await
+        }
+        "provider_status" => Ok(service.provider_status()),
         "web_search" => {
             let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
                 GrokSearchError::InvalidParams("web_search.query is required".into())
@@ -221,8 +238,16 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                     .get("response_format")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                mode: args.get("mode").and_then(Value::as_str).map(str::to_string),
+                max_results: args
+                    .get("max_results")
+                    .and_then(Value::as_u64)
+                    .map(|value| value as usize),
             };
-            let output = service.web_search(input).await?;
+            let output = service
+                .web_search(input)
+                .await
+                .map_err(with_fallback_hint)?;
             Ok(serde_json::to_value(output)
                 .map_err(|err| GrokSearchError::Parse(format!("serialize output: {err}")))?)
         }
@@ -248,15 +273,23 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                 .map_err(|err| GrokSearchError::Parse(format!("serialize sources: {err}")))?)
         }
         "web_fetch" => {
-            let url = args.get("url").and_then(Value::as_str).ok_or_else(|| {
-                GrokSearchError::InvalidParams("web_fetch.url is required".into())
-            })?;
             let max_chars = args
                 .get("max_chars")
                 .and_then(Value::as_u64)
                 .map(|value| value as usize)
                 .filter(|value| *value > 0);
-            let output = service.web_fetch(url, max_chars).await?;
+            let options = parse_fetch_options(&args)?;
+            if let Some(urls) = args.get("urls") {
+                let urls = parse_http_urls(urls)?;
+                let output = service.web_fetch_batch(&urls, max_chars, &options).await?;
+                return serde_json::to_value(output)
+                    .map_err(|err| GrokSearchError::Parse(format!("serialize fetch: {err}")));
+            }
+            let url = args.get("url").and_then(Value::as_str).ok_or_else(|| {
+                GrokSearchError::InvalidParams("web_fetch.url or web_fetch.urls is required".into())
+            })?;
+            require_http_url(url)?;
+            let output = service.web_fetch_with(url, max_chars, &options).await?;
             Ok(serde_json::to_value(output)
                 .map_err(|err| GrokSearchError::Parse(format!("serialize fetch: {err}")))?)
         }
@@ -287,36 +320,46 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "web_search",
-                "description": "Use for discovery — when you don't have a specific URL and need to find information, debug an error, research a topic, or track down an issue or news item. Returns an AI-synthesised answer plus a source list. By default the first few sources carry inline content (max_inline_sources, default 5); the rest are metadata-only — drill into any of them with web_fetch(url). The whole response is capped by a character budget; when truncated=true, trimmed sources carry a note telling you how to recover the full text via web_fetch or get_sources. Pass response_format=\"concise\" for answer + source metadata only. If you already know the exact page URL, use web_fetch instead.",
+                "description": "Search the live web. Use for discovery and current facts when you do not have a URL; if the user gave an exact URL, call web_fetch on it first. The server's engine (LLM_SEARCH_PROVIDER) decides the pipeline: `brave` (default) routes Brave / Tavily by `mode` — quick (default): Brave first, Tavily fallback, for broad discovery, docs, URLs, news; deep: Tavily advanced first with a Tavily answer and inline page text, for research; verify: Brave and Tavily in parallel, merged, for important claims that need cross-checking. `grok` returns a Grok-written answer plus sources (mode is ignored). Every result has `source_log` (cite sources by `source_id`, e.g. src_001). When `notice` is present a fallback provider served the result: say so in your answer. When truncated=true, recover trimmed text via web_fetch or get_sources.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["query"],
                     "properties": {
                         "query": { "type": "string" },
+                        "mode": {
+                            "type": "string",
+                            "enum": ["quick", "deep", "verify"],
+                            "description": "Router mode (engine `brave` only). quick = Brave then Tavily (cheapest); deep = Tavily advanced then Brave, with answer and page text; verify = Brave + Tavily in parallel, merged (costs both)."
+                        },
+                        "max_results": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 10,
+                            "description": "Results to return (engine `brave` only). Default 5."
+                        },
                         "extra_sources": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Optional supplemental source count, served by the configured source chain (default order: Tavily, then Exa, TinyFish, Firecrawl — first provider with results wins; GROK_SEARCH_SOURCE_PROVIDERS overrides). If omitted, GROK_SEARCH_EXTRA_SOURCES is used."
+                            "description": "Engine `grok` only: supplemental source count, served by the configured source chain (default order: Tavily, then Exa, TinyFish, Firecrawl, Brave — first provider with results wins; GROK_SEARCH_SOURCE_PROVIDERS overrides). If omitted, GROK_SEARCH_EXTRA_SOURCES is used. Use max_results with engine `brave`."
                         },
                         "recency_days": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Restrict supplemental results to sources published within the last N days. Honored natively by Tavily (days+topic=news), Exa (startPublishedDate), and TinyFish (recency window); providers that cannot honor filters (Firecrawl) are skipped for filtered requests. Also hinted to Grok prompt."
+                            "description": "Restrict results to sources published within the last N days. Honored natively by Brave (freshness), Tavily (days+topic=news), Exa (startPublishedDate), and TinyFish (recency window); providers that cannot honor filters (Firecrawl) are skipped for filtered requests. Also hinted to the Grok prompt."
                         },
                         "include_domains": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Only return supplemental results from these domains. Tavily/Exa/TinyFish honor strictly via native domain parameters; filter-blind providers are skipped. Grok receives as soft preference."
+                            "description": "Only return results from these domains. Brave (site: operator plus host filter) and Tavily/Exa/TinyFish (native domain parameters) honor it strictly; filter-blind providers are skipped. Grok receives it as a soft preference."
                         },
                         "exclude_domains": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "Suppress supplemental results from these domains. Tavily/Exa/TinyFish honor strictly via native domain parameters; filter-blind providers are skipped. Grok receives as soft instruction."
+                            "description": "Suppress results from these domains. Brave (-site: operator plus host filter) and Tavily/Exa/TinyFish (native domain parameters) honor it strictly; filter-blind providers are skipped. Grok receives it as a soft instruction."
                         },
                         "include_content": {
                             "type": "boolean",
-                            "default": true,
-                            "description": "Inline source content via the resolve_content pipeline. Default true. Pass false to get summary + source-list only (legacy behavior, no content field in sources). Superseded by response_format when both are set."
+                            "description": "Fetch page text into sources that lack it (via the resolve_content pipeline). Default true for engine `grok`, false for engine `brave` (deep/verify already carry Tavily page text). Superseded by response_format when both are set."
                         },
                         "response_format": {
                             "type": "string",
@@ -350,16 +393,32 @@ fn tools_list() -> Value {
             },
             {
                 "name": "web_fetch",
-                "description": "Use when you already have a specific URL and want to read a single page in depth. GitHub issue/PR, StackOverflow (StackExchange), arXiv, and Wikipedia URLs are automatically parsed into structured, de-noised Markdown ready to feed an LLM; all other pages fall back to generic extraction. Returns {url, content, original_length, truncated, source_type, fallback_reason?}. If you don't have a URL yet and need to discover sources, use web_search instead.",
+                "description": "Read exact pages. Use first whenever the user supplies a URL; use after web_search when the answer needs source text. GitHub issue/PR, StackOverflow (StackExchange), arXiv, and Wikipedia URLs are parsed into structured Markdown; other pages go through Tavily Extract, then Exa, TinyFish, Firecrawl (first that returns content). Pass `url` for one page or `urls` (up to 10) for several. Returns content with provenance: provider, content_hash (SHA-256 of the returned content), extracted_at, and source_log. Only http(s) URLs are accepted.",
                 "inputSchema": {
                     "type": "object",
-                    "required": ["url"],
                     "properties": {
-                        "url": { "type": "string" },
+                        "url": { "type": "string", "description": "One URL to read." },
+                        "urls": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "minItems": 1,
+                            "maxItems": 10,
+                            "description": "Several URLs to read; failures are listed in `failed` instead of failing the call. Takes precedence over `url`."
+                        },
+                        "depth": {
+                            "type": "string",
+                            "enum": ["basic", "advanced"],
+                            "description": "Tavily Extract depth. advanced handles harder pages (tables, embedded content) at twice the credit cost. Omit for Tavily's default."
+                        },
+                        "format": {
+                            "type": "string",
+                            "enum": ["markdown", "text"],
+                            "description": "Tavily Extract output format. Default markdown."
+                        },
                         "max_chars": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Optional character cap on returned content. Falls back to GROK_SEARCH_FETCH_MAX_CHARS, otherwise unlimited."
+                            "description": "Character cap. With `url`: per page, default GROK_SEARCH_FETCH_MAX_CHARS (unlimited if unset). With `urls`: one budget shared by all pages in order, default GROK_SEARCH_RESPONSE_MAX_CHARS."
                         }
                     }
                 }
@@ -377,12 +436,88 @@ fn tools_list() -> Value {
                 }
             },
             {
-                "name": "doctor",
-                "description": "Diagnostic probe: live connectivity check for the Grok backend and every configured source provider (Tavily / Exa / TinyFish / Firecrawl), plus the effective source chain and masked configuration. Use to verify the server is wired up and reachable.",
+                "name": "provider_status",
+                "description": "Configuration check that makes no provider request and costs no quota: which providers (Brave, Tavily, Exa, TinyFish, Firecrawl, Grok) are configured, the active web_search engine, and the order each tool tries providers in. Never returns secrets. Use this first when checking setup.",
                 "inputSchema": { "type": "object", "properties": {} }
+            },
+            {
+                "name": "doctor",
+                "description": "Live health check: calls each provider (Brave, Tavily, Exa, TinyFish, Firecrawl, Grok) and reports status ok / not_configured / auth_error / rate_limited / timeout / error, plus masked configuration. It may consume provider quota, so call it only for explicit diagnostics; use provider_status for a free configuration check.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "provider": {
+                            "type": "string",
+                            "enum": ["all", "brave", "tavily", "exa", "tinyfish", "firecrawl", "grok"],
+                            "description": "Check one provider only. Default all."
+                        }
+                    }
+                }
             }
         ]
     })
+}
+
+/// Append [`NATIVE_SEARCH_FALLBACK_HINT`] to upstream failures. Parameter and
+/// configuration errors keep their own message: the caller can fix those.
+fn with_fallback_hint(err: GrokSearchError) -> GrokSearchError {
+    match err {
+        GrokSearchError::Provider(message) => {
+            GrokSearchError::Provider(format!("{message}\n\n{NATIVE_SEARCH_FALLBACK_HINT}"))
+        }
+        GrokSearchError::Timeout(message) => {
+            GrokSearchError::Timeout(format!("{message}\n\n{NATIVE_SEARCH_FALLBACK_HINT}"))
+        }
+        other => other,
+    }
+}
+
+/// `depth` (`basic` / `advanced`) and `format` (`markdown` / `text`).
+fn parse_fetch_options(args: &Value) -> Result<FetchOptions> {
+    let depth = match args.get("depth").and_then(Value::as_str) {
+        None => None,
+        Some("basic") => Some(SearchDepth::Basic),
+        Some("advanced") => Some(SearchDepth::Advanced),
+        Some(other) => {
+            return Err(GrokSearchError::InvalidParams(format!(
+                "web_fetch.depth must be \"basic\" or \"advanced\", got \"{other}\""
+            )))
+        }
+    };
+    let format = match args.get("format").and_then(Value::as_str) {
+        None | Some("markdown") => ExtractFormat::Markdown,
+        Some("text") => ExtractFormat::Text,
+        Some(other) => {
+            return Err(GrokSearchError::InvalidParams(format!(
+                "web_fetch.format must be \"markdown\" or \"text\", got \"{other}\""
+            )))
+        }
+    };
+    Ok(FetchOptions { depth, format })
+}
+
+/// Only HTTP(S) URLs are fetched.
+fn require_http_url(url: &str) -> Result<()> {
+    match url::Url::parse(url.trim()) {
+        Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => Ok(()),
+        _ => Err(GrokSearchError::InvalidParams(format!(
+            "web_fetch only accepts http(s) URLs, got \"{url}\""
+        ))),
+    }
+}
+
+/// `urls`: 1 to [`MAX_FETCH_URLS`] HTTP(S) URLs.
+fn parse_http_urls(value: &Value) -> Result<Vec<String>> {
+    let urls = parse_string_array(Some(value));
+    if urls.is_empty() || urls.len() > MAX_FETCH_URLS {
+        return Err(GrokSearchError::InvalidParams(format!(
+            "web_fetch.urls must hold 1 to {MAX_FETCH_URLS} URLs"
+        )));
+    }
+    for url in &urls {
+        require_http_url(url)?;
+    }
+    Ok(urls)
 }
 
 fn parse_string_array(value: Option<&Value>) -> Vec<String> {
@@ -474,7 +609,7 @@ mod tests {
         .expect("initialize response");
         // An existing stdio client must still see its own requested revision.
         assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
-        assert_eq!(response["result"]["serverInfo"]["name"], "grok-search-rs");
+        assert_eq!(response["result"]["serverInfo"]["name"], "llm-search");
     }
 
     #[tokio::test]
@@ -566,25 +701,39 @@ mod tests {
                 .to_string()
         };
 
-        // web_search: discovery-type cue, explicit no-URL case; must NOT
-        // recommend itself for single-page reads (that's web_fetch's job).
+        // web_search: discovery cue and the no-URL case; routes exact URLs
+        // to web_fetch; names the three router modes; asks for citation by
+        // source_log id and disclosure of a fallback notice. It must NOT
+        // claim the single-page-read role (that's web_fetch's job).
         let web_search = desc("web_search");
         assert!(web_search.contains("discovery"), "web_search: {web_search}");
         assert!(
-            web_search.contains("don't have a specific URL"),
+            web_search.contains("do not have a URL"),
             "web_search: {web_search}"
         );
+        assert!(web_search.contains("web_fetch"), "web_search: {web_search}");
+        for mode in ["quick", "deep", "verify"] {
+            assert!(
+                web_search.contains(mode),
+                "web_search lacks {mode}: {web_search}"
+            );
+        }
+        assert!(
+            web_search.contains("source_log"),
+            "web_search: {web_search}"
+        );
+        assert!(web_search.contains("notice"), "web_search: {web_search}");
         assert!(
             !web_search.contains("read a single page"),
             "web_search must not claim the single-page-read role: {web_search}"
         );
 
-        // web_fetch: targeted single-page read, names all four special
-        // sources, cross-references web_search.
+        // web_fetch: exact-URL reads first, names all four special sources,
+        // reports provenance, cross-references web_search.
         let web_fetch = desc("web_fetch");
-        assert!(web_fetch.contains("specific URL"), "web_fetch: {web_fetch}");
+        assert!(web_fetch.contains("exact pages"), "web_fetch: {web_fetch}");
         assert!(
-            web_fetch.contains("read a single page"),
+            web_fetch.contains("user supplies a URL"),
             "web_fetch: {web_fetch}"
         );
         assert!(web_fetch.contains("GitHub issue"), "web_fetch: {web_fetch}");
@@ -594,7 +743,17 @@ mod tests {
         );
         assert!(web_fetch.contains("arXiv"), "web_fetch: {web_fetch}");
         assert!(web_fetch.contains("Wikipedia"), "web_fetch: {web_fetch}");
+        assert!(web_fetch.contains("content_hash"), "web_fetch: {web_fetch}");
         assert!(web_fetch.contains("web_search"), "web_fetch: {web_fetch}");
+
+        // provider_status is free; doctor warns that it costs quota.
+        let status = desc("provider_status");
+        assert!(
+            status.contains("no provider request"),
+            "provider_status: {status}"
+        );
+        let doctor = desc("doctor");
+        assert!(doctor.contains("may consume"), "doctor: {doctor}");
 
         // get_sources: reuses a prior web_search session, runs no new search.
         let get_sources = desc("get_sources");

@@ -1,4 +1,4 @@
-use grok_search_rs::logging::redact_json_value;
+use llm_search::logging::redact_json_value;
 
 #[test]
 fn debug_log_redacts_authorization_and_api_keys() {

@@ -1,4 +1,4 @@
-use grok_search_rs::model::source::{merge_sources, Source};
+use llm_search::model::source::{merge_sources, Source};
 
 #[test]
 fn merge_sources_dedupes_by_url_and_preserves_first_provider() {

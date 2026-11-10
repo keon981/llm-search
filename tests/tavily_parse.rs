@@ -1,6 +1,6 @@
-use grok_search_rs::model::search::SearchFilters;
-use grok_search_rs::model::source::Source;
-use grok_search_rs::providers::tavily::{
+use llm_search::model::search::SearchFilters;
+use llm_search::model::source::Source;
+use llm_search::providers::tavily::{
     limit_tavily_results, normalize_tavily_results, parse_tavily_extract, tavily_map_request_body,
     tavily_search_request_body,
 };

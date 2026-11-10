@@ -66,6 +66,23 @@ impl FetchedPage {
     }
 }
 
+/// Cap `text` at `max_chars` characters, ending with a marker that says how
+/// much was cut. `max_chars == 0` means no cap. The marker counts toward the
+/// cap, so the result never exceeds it.
+pub fn truncate_with_marker(text: &str, max_chars: usize) -> String {
+    let total = text.chars().count();
+    if max_chars == 0 || total <= max_chars {
+        return text.to_string();
+    }
+    let marker = format!("... [truncated {} chars]", total - max_chars);
+    let marker_len = marker.chars().count();
+    if marker_len >= max_chars {
+        return text.chars().take(max_chars).collect();
+    }
+    let keep: String = text.chars().take(max_chars - marker_len).collect();
+    format!("{keep}{marker}")
+}
+
 /// Upstream annotation payloads have been observed carrying the citation index
 /// as the title (`"1"`, `"2"` — issue #21); single characters and purely
 /// numeric strings are those artifacts, never real page titles.
@@ -91,6 +108,16 @@ pub fn merge_sources(primary: Vec<Source>, secondary: Vec<Source>) -> Vec<Source
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_with_marker_respects_the_cap() {
+        assert_eq!(truncate_with_marker("short", 100), "short");
+        assert_eq!(truncate_with_marker("anything", 0), "anything");
+        let long = "x".repeat(200);
+        let cut = truncate_with_marker(&long, 100);
+        assert_eq!(cut.chars().count(), 100);
+        assert!(cut.ends_with("... [truncated 100 chars]"));
+    }
 
     #[test]
     fn source_content_none_omitted_from_json() {

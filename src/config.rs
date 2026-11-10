@@ -16,8 +16,35 @@ pub enum AuthMode {
     OAuth,
 }
 
+/// Which pipeline serves `web_search` (`LLM_SEARCH_PROVIDER`).
+///
+/// - `Brave` (default): the Brave / Tavily router — `quick` (Brave first),
+///   `deep` (Tavily advanced first), `verify` (both in parallel). Grok is not
+///   needed and not called.
+/// - `Grok`: the original GrokSearch-rs pipeline — Grok writes the answer and
+///   the source chain enriches or replaces it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchEngine {
+    Brave,
+    Grok,
+}
+
+impl SearchEngine {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchEngine::Brave => "brave",
+            SearchEngine::Grok => "grok",
+        }
+    }
+}
+
 #[derive(Clone, PartialEq, Eq)]
 pub struct Config {
+    /// Pipeline that serves `web_search`; see [`SearchEngine`].
+    pub search_engine: SearchEngine,
+    pub brave_api_url: String,
+    pub brave_api_key: Option<String>,
+    pub brave_enabled: bool,
     pub grok_api_url: String,
     pub grok_api_key: Option<String>,
     pub grok_auth_mode: AuthMode,
@@ -114,6 +141,10 @@ impl std::fmt::Debug for Config {
             }
         }
         f.debug_struct("Config")
+            .field("search_engine", &self.search_engine)
+            .field("brave_api_url", &self.brave_api_url)
+            .field("brave_api_key", &mask(&self.brave_api_key))
+            .field("brave_enabled", &self.brave_enabled)
             .field("grok_api_url", &self.grok_api_url)
             .field("grok_api_key", &mask(&self.grok_api_key))
             .field("grok_auth_mode", &self.grok_auth_mode)
@@ -165,6 +196,10 @@ impl std::fmt::Debug for Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 struct ConfigFile {
+    llm_search_provider: Option<String>,
+    brave_api_url: Option<String>,
+    brave_api_key: Option<String>,
+    brave_enabled: Option<bool>,
     grok_api_url: Option<String>,
     grok_api_key: Option<String>,
     grok_auth_mode: Option<String>,
@@ -213,6 +248,10 @@ impl ConfigFile {
                 out.insert(key.to_string(), v);
             }
         };
+        insert("LLM_SEARCH_PROVIDER", self.llm_search_provider);
+        insert("BRAVE_API_URL", self.brave_api_url);
+        insert("BRAVE_API_KEY", self.brave_api_key);
+        insert("BRAVE_ENABLED", self.brave_enabled.map(|b| b.to_string()));
         insert("GROK_SEARCH_URL", self.grok_api_url);
         insert("GROK_SEARCH_API_KEY", self.grok_api_key);
         insert("GROK_SEARCH_AUTH_MODE", self.grok_auth_mode);
@@ -351,6 +390,24 @@ impl Config {
         let grok_auth_mode = auth_mode_value(&map);
 
         Self {
+            search_engine: search_engine_value(&map),
+            brave_api_url: normalize_plain_base(&get(
+                &map,
+                "BRAVE_API_URL",
+                "https://api.search.brave.com",
+            )),
+            // `BRAVE_SEARCH_API_KEY` is accepted as an alias (the name the
+            // official Brave MCP server uses). The primary name wins when both
+            // are set. Blank means absent, as for every other provider key.
+            brave_api_key: map
+                .get("BRAVE_API_KEY")
+                .filter(|value| !value.trim().is_empty())
+                .or_else(|| {
+                    map.get("BRAVE_SEARCH_API_KEY")
+                        .filter(|value| !value.trim().is_empty())
+                })
+                .map(|value| value.trim().to_string()),
+            brave_enabled: bool_value(&map, "BRAVE_ENABLED", true),
             grok_api_url: normalize_v1_base(&get(&map, "GROK_SEARCH_URL", "https://api.x.ai")),
             grok_api_key: map.get("GROK_SEARCH_API_KEY").cloned(),
             grok_auth_mode,
@@ -452,9 +509,40 @@ impl Config {
         }
     }
 
+    /// Every configured secret value, for output redaction at the MCP
+    /// boundary. Comma-separated key lists (Tavily rotation) are split so each
+    /// key is masked on its own. Values shorter than 8 characters are skipped:
+    /// masking a short string would mangle unrelated text.
+    pub fn secret_values(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for value in [
+            &self.brave_api_key,
+            &self.grok_api_key,
+            &self.tavily_api_key,
+            &self.firecrawl_api_key,
+            &self.tinyfish_api_key,
+            &self.exa_api_key,
+            &self.openai_compatible_api_key,
+            &self.github_token,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for part in value.split(',') {
+                let part = part.trim();
+                if part.chars().count() >= 8 && !out.iter().any(|known| known == part) {
+                    out.push(part.to_string());
+                }
+            }
+        }
+        out
+    }
+
     pub fn redacted_diagnostics(&self) -> String {
         format!(
-            "grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} default_extra_sources={} fallback_sources={} timeout_seconds={} github_token={}",
+            "search_engine={} brave_api_key={} grok_api_url={} grok_api_key={} grok_auth_mode={:?} grok_auth_file={} grok_model={} web_search_enabled={} x_search_enabled={} tavily_api_key={} firecrawl_api_key={} tinyfish_api_key={} exa_api_key={} default_extra_sources={} fallback_sources={} timeout_seconds={} github_token={}",
+            self.search_engine.as_str(),
+            redact(self.brave_api_key.as_deref()),
             self.grok_api_url,
             redact(self.grok_api_key.as_deref()),
             self.grok_auth_mode,
@@ -574,7 +662,7 @@ pub fn write_template(path: &Path) -> std::io::Result<InitOutcome> {
 
 /// Embedded TOML template. All keys are commented so an empty scaffold cannot
 /// silently override built-in defaults; the user uncomments only what they need.
-pub const CONFIG_TEMPLATE: &str = r#"# grok-search-rs global configuration
+pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSearch-rs fork)
 # Default path:
 #   Unix / macOS / Git Bash:   $HOME/.config/grok-search-rs/config.toml
 #   Windows (PowerShell/cmd):  %USERPROFILE%\.config\grok-search-rs\config.toml
@@ -584,13 +672,19 @@ pub const CONFIG_TEMPLATE: &str = r#"# grok-search-rs global configuration
 # All keys below are commented out; uncomment and fill what you need.
 # Unknown keys are rejected — typos surface as errors, not silent drops.
 
-# ── Required ──────────────────────────────────────────────────
-# grok_api_key   = "xai-..."          # xAI / Grok key   https://x.ai/api
-# grok_auth_mode = "api_key"          # api_key | oauth
-# grok_auth_file = "C:\\Users\\you\\.config\\grok-search-rs\\auth.json"
+# ── web_search engine ─────────────────────────────────────────
+# llm_search_provider = "brave"       # brave (Brave/Tavily router, default) | grok
+# brave_api_key       = "BSA..."      # Brave Search key  https://brave.com/search/api/
+# brave_api_url       = "https://api.search.brave.com"
+# brave_enabled       = true
 # tavily_api_key = "tvly-..."         # Tavily key       https://tavily.com
 #                                     # comma-separated list rotates keys round-robin
 #                                     # e.g. "tvly-a,tvly-b" (failover on 401/429/432/433)
+
+# ── Grok (required only when llm_search_provider = "grok") ────
+# grok_api_key   = "xai-..."          # xAI / Grok key   https://x.ai/api
+# grok_auth_mode = "api_key"          # api_key | oauth
+# grok_auth_file = "C:\\Users\\you\\.config\\grok-search-rs\\auth.json"
 
 # ── Common knobs ──────────────────────────────────────────────
 # grok_model         = "grok-4-1-fast-reasoning"
@@ -598,7 +692,7 @@ pub const CONFIG_TEMPLATE: &str = r#"# grok-search-rs global configuration
 # firecrawl_api_key  = "fc-..."       # Optional fetch fallback   https://firecrawl.dev
 # tinyfish_api_key   = "tf-..."       # Optional free search/fetch  https://tinyfish.ai
 # exa_api_key        = "exa-..."      # Optional semantic search    https://exa.ai
-# source_providers   = ["tavily", "exa", "tinyfish", "firecrawl"]
+# source_providers   = ["tavily", "exa", "tinyfish", "firecrawl", "brave"]
 #                                     # explicit chain order; omit for the
 #                                     # built-in order over configured providers
 
@@ -660,7 +754,7 @@ fn read_config_file(path: &Path) -> (HashMap<String, String>, ConfigFileState) {
             // Kept for anyone running the binary directly; the recorded state
             // is what reaches an MCP client.
             eprintln!(
-                "grok-search-rs: ignoring malformed config {}: {}",
+                "llm-search: ignoring malformed config {}: {}",
                 path.display(),
                 err
             );
@@ -738,6 +832,25 @@ fn csv_list(map: &HashMap<String, String>, key: &str) -> Vec<String> {
 
 fn bool_literal(value: &str) -> bool {
     matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+}
+
+/// `LLM_SEARCH_PROVIDER`: `brave` (default) or `grok`. An unknown value warns
+/// on stderr and falls back to the default, mirroring `GROK_SEARCH_AUTH_MODE`.
+fn search_engine_value(map: &HashMap<String, String>) -> SearchEngine {
+    match map
+        .get("LLM_SEARCH_PROVIDER")
+        .map(|value| (value.trim(), value.trim().to_ascii_lowercase()))
+    {
+        Some((_, value)) if value == "brave" || value.is_empty() => SearchEngine::Brave,
+        Some((_, value)) if value == "grok" => SearchEngine::Grok,
+        Some((raw, _)) => {
+            eprintln!(
+                "llm-search: unknown LLM_SEARCH_PROVIDER=\"{raw}\"; falling back to brave. Valid values: brave, grok."
+            );
+            SearchEngine::Brave
+        }
+        None => SearchEngine::Brave,
+    }
 }
 
 fn auth_mode_value(map: &HashMap<String, String>) -> AuthMode {

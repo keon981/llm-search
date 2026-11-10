@@ -1,6 +1,8 @@
 use crate::error::Result;
-use crate::model::search::SearchFilters;
-use crate::model::source::{FetchedPage, Source};
+use crate::model::search::{
+    DetailedSearch, FetchOptions, SearchDepth, SearchFilters, SearchOptions,
+};
+use crate::model::source::{truncate_with_marker, FetchedPage, Source};
 use crate::providers::http::{build_client, post_json_with_status};
 use crate::providers::keyring::{is_key_scoped_status, KeyRing};
 use reqwest::Client;
@@ -55,11 +57,52 @@ impl TavilyProvider {
         Ok(normalize_tavily_results(&raw))
     }
 
-    pub async fn extract(&self, url: &str) -> Result<FetchedPage> {
+    /// Router-mode search: honors depth, provider answer, and inline page
+    /// text. `search` stays the basic, answer-less call the source chain uses.
+    pub async fn search_with(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+        options: &SearchOptions,
+    ) -> Result<DetailedSearch> {
         let raw = self
-            .post("extract", &json!({ "urls": [url], "format": "markdown" }))
+            .post(
+                "search",
+                &tavily_search_request_body_with(query, max_results, filters, options),
+            )
             .await?;
-        parse_tavily_extract(&raw)
+        Ok(parse_tavily_detailed(&raw, options.raw_content_max_chars))
+    }
+
+    pub async fn extract(&self, url: &str) -> Result<FetchedPage> {
+        self.extract_with(url, &FetchOptions::default()).await
+    }
+
+    /// Extract with an explicit depth / format. `depth: None` omits
+    /// `extract_depth`, leaving Tavily's default.
+    ///
+    /// Pages that build their content with JavaScript (e.g. 104.com.tw job
+    /// pages) come back empty at the default depth but extract fine at
+    /// `advanced`, so an empty result is retried once at `advanced` unless
+    /// the caller already asked for it. The retry costs Tavily's advanced
+    /// rate, and only runs when the first call returned nothing.
+    pub async fn extract_with(&self, url: &str, options: &FetchOptions) -> Result<FetchedPage> {
+        let raw = self
+            .post("extract", &tavily_extract_request_body(url, options))
+            .await?;
+        match parse_tavily_extract(&raw) {
+            Err(GrokSearchError::Provider(message)) if message == EMPTY_EXTRACT => {
+                let Some(retry) = advanced_retry_options(options) else {
+                    return Err(GrokSearchError::Provider(message));
+                };
+                let raw = self
+                    .post("extract", &tavily_extract_request_body(url, &retry))
+                    .await?;
+                parse_tavily_extract(&raw)
+            }
+            other => other,
+        }
     }
 
     pub async fn map(&self, url: &str, max_results: usize) -> Result<Vec<Source>> {
@@ -88,7 +131,7 @@ impl TavilyProvider {
                     let key_scoped = failure.status.is_some_and(is_key_scoped_status);
                     if key_scoped && offset + 1 < attempts {
                         eprintln!(
-                            "grok-search-rs: Tavily key {}/{} hit HTTP {}; rotating to next key",
+                            "llm-search: Tavily key {}/{} hit HTTP {}; rotating to next key",
                             (start + offset) % attempts + 1,
                             attempts,
                             failure.status.unwrap_or_default(),
@@ -141,6 +184,71 @@ pub fn tavily_search_request_body(
     serde_json::to_value(&body).expect("tavily search body must serialize")
 }
 
+/// [`tavily_search_request_body`] plus the router-mode options: `search_depth`,
+/// `include_answer`, and `include_raw_content` (as `"markdown"`).
+pub fn tavily_search_request_body_with(
+    query: &str,
+    max_results: usize,
+    filters: &SearchFilters,
+    options: &SearchOptions,
+) -> Value {
+    let mut body = tavily_search_request_body(query, max_results, filters);
+    let object = body.as_object_mut().expect("tavily body is an object");
+    object.insert("search_depth".into(), json!(options.depth.as_str()));
+    object.insert("include_answer".into(), json!(options.include_answer));
+    if options.include_raw_content {
+        object.insert("include_raw_content".into(), json!("markdown"));
+    }
+    body
+}
+
+/// Body for `POST /extract`.
+pub fn tavily_extract_request_body(url: &str, options: &FetchOptions) -> Value {
+    let mut body = json!({ "urls": [url], "format": options.format.as_str() });
+    if let Some(depth) = options.depth {
+        body.as_object_mut()
+            .expect("literal object")
+            .insert("extract_depth".into(), json!(depth.as_str()));
+    }
+    body
+}
+
+/// Parse a router-mode search response: the provider answer (when present and
+/// non-blank) plus normalized sources, each carrying its page text as inline
+/// `content` when Tavily returned `raw_content`, capped at `raw_max_chars`.
+pub fn parse_tavily_detailed(raw: &Value, raw_max_chars: usize) -> DetailedSearch {
+    let answer = raw
+        .get("answer")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let raw_by_url: std::collections::HashMap<&str, &str> = raw
+        .get("results")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let url = item.get("url").and_then(Value::as_str)?;
+            let text = item
+                .get("raw_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.trim().is_empty())?;
+            Some((url, text))
+        })
+        .collect();
+    let sources = normalize_tavily_results(raw)
+        .into_iter()
+        .map(|mut source| {
+            if let Some(text) = raw_by_url.get(source.url.as_str()) {
+                source.content = Some(truncate_with_marker(text, raw_max_chars));
+            }
+            source
+        })
+        .collect();
+    DetailedSearch { answer, sources }
+}
+
 pub fn tavily_map_request_body(url: &str, max_results: usize) -> Value {
     json!({
         "url": url,
@@ -158,6 +266,17 @@ pub fn limit_tavily_results(mut sources: Vec<Source>, max_results: usize) -> Vec
 /// endpoint returns `title` alongside `raw_content` (verified live; the docs'
 /// sample response omits it) but no published-date field, so `published_date`
 /// is always `None` here.
+const EMPTY_EXTRACT: &str = "Tavily extract returned empty content";
+
+/// Options for the one `advanced` retry after an empty extract, or `None`
+/// when the first call already used `advanced`.
+pub fn advanced_retry_options(options: &FetchOptions) -> Option<FetchOptions> {
+    (options.depth != Some(SearchDepth::Advanced)).then_some(FetchOptions {
+        depth: Some(SearchDepth::Advanced),
+        ..*options
+    })
+}
+
 pub fn parse_tavily_extract(raw: &Value) -> Result<FetchedPage> {
     let result = raw
         .get("results")
@@ -170,9 +289,7 @@ pub fn parse_tavily_extract(raw: &Value) -> Result<FetchedPage> {
         .filter(|text| !text.trim().is_empty());
 
     let Some(content) = content else {
-        return Err(GrokSearchError::Provider(
-            "Tavily extract returned empty content".to_string(),
-        ));
+        return Err(GrokSearchError::Provider(EMPTY_EXTRACT.to_string()));
     };
     let title = result
         .and_then(|item| item.get("title"))
@@ -233,6 +350,108 @@ pub fn normalize_tavily_results(raw: &Value) -> Vec<Source> {
             Some(source)
         })
         .collect()
+}
+
+#[cfg(test)]
+mod router_body_tests {
+    use super::*;
+    use crate::model::search::{ExtractFormat, SearchDepth};
+
+    #[test]
+    fn empty_extract_retries_once_at_advanced_keeping_format() {
+        let default = FetchOptions::default();
+        assert_eq!(
+            advanced_retry_options(&default),
+            Some(FetchOptions {
+                depth: Some(SearchDepth::Advanced),
+                format: default.format,
+            })
+        );
+        let basic_text = FetchOptions {
+            depth: Some(SearchDepth::Basic),
+            format: ExtractFormat::Text,
+        };
+        assert_eq!(
+            advanced_retry_options(&basic_text),
+            Some(FetchOptions {
+                depth: Some(SearchDepth::Advanced),
+                format: ExtractFormat::Text,
+            })
+        );
+        let advanced = FetchOptions {
+            depth: Some(SearchDepth::Advanced),
+            ..FetchOptions::default()
+        };
+        assert_eq!(advanced_retry_options(&advanced), None);
+    }
+
+    #[test]
+    fn empty_extract_error_message_is_stable() {
+        let err = parse_tavily_extract(&serde_json::json!({ "results": [] })).unwrap_err();
+        assert!(matches!(err, GrokSearchError::Provider(ref m) if m == EMPTY_EXTRACT));
+    }
+
+    #[test]
+    fn deep_body_requests_answer_raw_content_and_advanced_depth() {
+        let options = SearchOptions {
+            depth: SearchDepth::Advanced,
+            include_answer: true,
+            include_raw_content: true,
+            raw_content_max_chars: 6000,
+        };
+        let body = tavily_search_request_body_with("q", 5, &SearchFilters::default(), &options);
+        assert_eq!(body["search_depth"], "advanced");
+        assert_eq!(body["include_answer"], true);
+        assert_eq!(body["include_raw_content"], "markdown");
+        assert_eq!(body["max_results"], 5);
+    }
+
+    #[test]
+    fn quick_body_stays_basic_without_raw_content() {
+        let body = tavily_search_request_body_with(
+            "q",
+            5,
+            &SearchFilters::default(),
+            &SearchOptions::default(),
+        );
+        assert_eq!(body["search_depth"], "basic");
+        assert_eq!(body["include_answer"], false);
+        assert!(body.get("include_raw_content").is_none());
+    }
+
+    #[test]
+    fn extract_body_omits_depth_unless_requested() {
+        let body = tavily_extract_request_body("https://a.example/", &FetchOptions::default());
+        assert_eq!(body["format"], "markdown");
+        assert!(body.get("extract_depth").is_none());
+
+        let options = FetchOptions {
+            depth: Some(SearchDepth::Advanced),
+            format: ExtractFormat::Text,
+        };
+        let body = tavily_extract_request_body("https://a.example/", &options);
+        assert_eq!(body["format"], "text");
+        assert_eq!(body["extract_depth"], "advanced");
+    }
+
+    #[test]
+    fn detailed_parse_attaches_capped_raw_content_and_answer() {
+        let raw = json!({
+            "answer": "  Tokio is an async runtime.  ",
+            "results": [
+                { "url": "https://tokio.rs/", "title": "Tokio", "content": "snippet", "score": 0.9, "raw_content": "x".repeat(50) },
+                { "url": "https://docs.rs/tokio", "title": "Docs", "content": "snippet", "score": 0.8 },
+                { "url": "https://junk.example/", "title": "Junk", "score": 0.01, "raw_content": "junk" }
+            ]
+        });
+        let parsed = parse_tavily_detailed(&raw, 30);
+        assert_eq!(parsed.answer.as_deref(), Some("Tokio is an async runtime."));
+        assert_eq!(parsed.sources.len(), 2);
+        let first = parsed.sources[0].content.as_deref().unwrap();
+        assert_eq!(first.chars().count(), 30);
+        assert!(first.contains("truncated"));
+        assert!(parsed.sources[1].content.is_none());
+    }
 }
 
 #[cfg(test)]

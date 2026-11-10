@@ -1,6 +1,6 @@
 use std::fs;
 
-use grok_search_rs::config::{self, AuthMode, Config, ConfigFileState, InitOutcome, Transport};
+use llm_search::config::{self, AuthMode, Config, ConfigFileState, InitOutcome, Transport};
 use tempfile::tempdir;
 
 #[test]
@@ -344,7 +344,7 @@ fn write_template_creates_file_then_is_idempotent() {
 
     let body = fs::read_to_string(&path).unwrap();
     assert!(
-        body.contains("grok-search-rs global configuration"),
+        body.contains("llm-search global configuration"),
         "template header must be present"
     );
 
@@ -627,4 +627,70 @@ fn a_good_config_file_is_recorded_as_loaded() {
 
     assert_eq!(cfg.config_file_state, ConfigFileState::Loaded);
     assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-good"));
+}
+
+#[test]
+fn search_engine_defaults_to_brave_and_accepts_grok() {
+    use llm_search::config::SearchEngine;
+    let default = Config::from_env_map([] as [(&str, &str); 0]);
+    assert_eq!(default.search_engine, SearchEngine::Brave);
+
+    let grok = Config::from_env_map([("LLM_SEARCH_PROVIDER", " Grok ")]);
+    assert_eq!(grok.search_engine, SearchEngine::Grok);
+
+    let unknown = Config::from_env_map([("LLM_SEARCH_PROVIDER", "bing")]);
+    assert_eq!(unknown.search_engine, SearchEngine::Brave);
+}
+
+#[test]
+fn brave_key_accepts_alias_and_ignores_blanks() {
+    let alias = Config::from_env_map([("BRAVE_SEARCH_API_KEY", "alias-key-123")]);
+    assert_eq!(alias.brave_api_key.as_deref(), Some("alias-key-123"));
+
+    let both = Config::from_env_map([
+        ("BRAVE_API_KEY", "primary-key-123"),
+        ("BRAVE_SEARCH_API_KEY", "alias-key-123"),
+    ]);
+    assert_eq!(both.brave_api_key.as_deref(), Some("primary-key-123"));
+
+    let blank = Config::from_env_map([
+        ("BRAVE_API_KEY", "   "),
+        ("BRAVE_SEARCH_API_KEY", "alias-key-123"),
+    ]);
+    assert_eq!(blank.brave_api_key.as_deref(), Some("alias-key-123"));
+
+    let none = Config::from_env_map([("BRAVE_API_KEY", "")]);
+    assert_eq!(none.brave_api_key, None);
+    assert!(none.brave_enabled);
+    assert_eq!(none.brave_api_url, "https://api.search.brave.com");
+}
+
+#[test]
+fn config_file_accepts_engine_and_brave_keys() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "llm_search_provider = \"grok\"\nbrave_api_key = \"file-brave-key\"\nbrave_enabled = false\n",
+    )
+    .unwrap();
+    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_str().unwrap())]);
+    assert_eq!(cfg.config_file_state.as_str(), "loaded");
+    assert_eq!(cfg.search_engine, llm_search::config::SearchEngine::Grok);
+    assert_eq!(cfg.brave_api_key.as_deref(), Some("file-brave-key"));
+    assert!(!cfg.brave_enabled);
+}
+
+#[test]
+fn secret_values_split_rotation_lists_and_skip_short_values() {
+    let cfg = Config::from_env_map([
+        ("BRAVE_API_KEY", "brave-0123456789"),
+        ("TAVILY_API_KEY", "tvly-aaaaaaaa,tvly-bbbbbbbb"),
+        ("EXA_API_KEY", "short"),
+    ]);
+    let secrets = cfg.secret_values();
+    assert!(secrets.contains(&"brave-0123456789".to_string()));
+    assert!(secrets.contains(&"tvly-aaaaaaaa".to_string()));
+    assert!(secrets.contains(&"tvly-bbbbbbbb".to_string()));
+    assert!(!secrets.iter().any(|s| s == "short"));
 }

@@ -1,3 +1,4 @@
+pub mod brave;
 pub mod exa;
 pub mod firecrawl;
 pub mod grok;

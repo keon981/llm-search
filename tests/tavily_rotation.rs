@@ -2,8 +2,8 @@
 //! server. Uses a std::net listener on a background thread — no new dev
 //! dependencies, no tokio `net` feature.
 
-use grok_search_rs::model::search::SearchFilters;
-use grok_search_rs::providers::tavily::TavilyProvider;
+use llm_search::model::search::SearchFilters;
+use llm_search::providers::tavily::TavilyProvider;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};

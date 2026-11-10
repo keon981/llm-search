@@ -1,4 +1,4 @@
-use grok_search_rs::providers::firecrawl::{normalize_firecrawl_results, parse_firecrawl_scrape};
+use llm_search::providers::firecrawl::{normalize_firecrawl_results, parse_firecrawl_scrape};
 use serde_json::json;
 
 #[test]

@@ -19,6 +19,46 @@ pub struct WebSearchInput {
     /// content, subject to the response budget). When set, takes precedence
     /// over the legacy `include_content` flag.
     pub response_format: Option<String>,
+    /// Router mode only (`LLM_SEARCH_PROVIDER=brave`): `"quick"` (default),
+    /// `"deep"`, or `"verify"`. Ignored, with a warning, in Grok mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Router mode only: results to return, clamped to 1..=10 (default 5).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_results: Option<usize>,
+}
+
+/// One provider that was tried and did not serve the result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchFallback {
+    pub provider: String,
+    pub error: String,
+}
+
+/// Provenance record for one returned source, cite-able by `source_id`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct SourceLogEntry {
+    /// `src_001`, `src_002`, … in returned order.
+    pub source_id: String,
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rank: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accessed_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extracted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_hash: Option<String>,
+    /// `"success"` or `"failed"`.
+    pub status: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -33,6 +73,25 @@ pub struct WebSearchOutput {
     /// True when the response budget trimmed inline source content. The cache
     /// keeps the full text — recover via `get_sources` or `web_fetch`.
     pub truncated: bool,
+    /// `"brave"` (router) or `"grok"` — the pipeline that served the call.
+    pub engine: String,
+    /// Router mode that ran (`quick` / `deep` / `verify`); absent in Grok mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Provider-generated answer (Tavily in deep / verify), when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+    /// Providers tried before the one that served the result, with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fallbacks: Vec<SearchFallback>,
+    /// Disclosure text whenever a fallback served the result.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notice: Option<String>,
+    /// Provenance for every returned source, in returned order.
+    pub source_log: Vec<SourceLogEntry>,
+    /// Non-fatal problems with the request (an ignored parameter, …).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +123,41 @@ pub struct WebFetchOutput {
     /// (decision D-01); omitted from JSON otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fallback_reason: Option<String>,
+    /// What produced the content: a source-chain provider (`tavily`, `exa`,
+    /// …) or a specialist extractor (`github`, `stackexchange`, …).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
+    /// SHA-256 (hex) of the returned `content`.
+    #[serde(default)]
+    pub content_hash: String,
+    /// UTC RFC 3339 time the content was extracted.
+    #[serde(default)]
+    pub extracted_at: String,
+    /// One provenance record for this page.
+    #[serde(default)]
+    pub source_log: Vec<SourceLogEntry>,
+}
+
+/// One URL of a multi-URL `web_fetch` that produced no content.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FetchFailure {
+    pub url: String,
+    pub error: String,
+}
+
+/// Multi-URL `web_fetch` (`urls` argument). `max_chars` is a budget shared by
+/// all results, spent in input order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebFetchBatchOutput {
+    pub results: Vec<WebFetchOutput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FetchFailure>,
+    /// Provenance for every URL, successes and failures, in input order.
+    pub source_log: Vec<SourceLogEntry>,
+    /// True when the shared budget cut any result.
+    pub truncated: bool,
 }
 
 #[cfg(test)]
@@ -80,6 +174,11 @@ mod tests {
             truncated: false,
             source_type: SourceType::Generic,
             fallback_reason: None,
+            provider: None,
+            domain: None,
+            content_hash: String::new(),
+            extracted_at: String::new(),
+            source_log: Vec::new(),
         };
         let value = serde_json::to_value(&output).unwrap();
         assert_eq!(value["source_type"], "generic");
@@ -95,6 +194,11 @@ mod tests {
             truncated: false,
             source_type: SourceType::Generic,
             fallback_reason: Some("github_issue empty render".to_string()),
+            provider: None,
+            domain: None,
+            content_hash: String::new(),
+            extracted_at: String::new(),
+            source_log: Vec::new(),
         };
         let value = serde_json::to_value(&output).unwrap();
         assert_eq!(value["fallback_reason"], "github_issue empty render");

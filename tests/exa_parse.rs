@@ -1,5 +1,5 @@
-use grok_search_rs::model::search::SearchFilters;
-use grok_search_rs::providers::exa::{
+use llm_search::model::search::SearchFilters;
+use llm_search::providers::exa::{
     exa_search_request_body, normalize_exa_results, parse_exa_contents, start_published_date,
 };
 use serde_json::json;

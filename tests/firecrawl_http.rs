@@ -1,8 +1,8 @@
 //! Exercise config normalization and both Firecrawl operations against a local
 //! gateway. Uses the same std TCP mock approach as the Tavily rotation tests.
 
-use grok_search_rs::config::Config;
-use grok_search_rs::providers::firecrawl::FirecrawlProvider;
+use llm_search::config::Config;
+use llm_search::providers::firecrawl::FirecrawlProvider;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;

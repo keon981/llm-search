@@ -1,17 +1,17 @@
 use async_trait::async_trait;
-use grok_search_rs::error::{GrokSearchError, Result};
-use grok_search_rs::model::search::{SearchFilters, SearchRequest, SearchResponse};
-use grok_search_rs::model::source::{FetchedPage, Source};
-use grok_search_rs::model::tool::WebSearchInput;
-use grok_search_rs::service::{AiProvider, SearchService, SourceProvider};
-use grok_search_rs::sources::{SourceCaps, SourceExtractor, SourceRouter, SourceType};
+use llm_search::error::{GrokSearchError, Result};
+use llm_search::model::search::{SearchFilters, SearchRequest, SearchResponse};
+use llm_search::model::source::{FetchedPage, Source};
+use llm_search::model::tool::WebSearchInput;
+use llm_search::service::{AiProvider, SearchService, SourceProvider};
+use llm_search::sources::{SourceCaps, SourceExtractor, SourceRouter, SourceType};
 use reqwest::Client;
 use std::sync::{Arc, Mutex};
 use url::Url;
 
 #[test]
 fn service_requires_grok_search_api_key() {
-    let cfg = grok_search_rs::config::Config::from_env_map([] as [(&str, &str); 0]);
+    let cfg = llm_search::config::Config::from_env_map([("LLM_SEARCH_PROVIDER", "grok")]);
     let result = SearchService::new(cfg);
 
     assert!(result.is_err());
@@ -20,6 +20,17 @@ fn service_requires_grok_search_api_key() {
         .unwrap()
         .to_string()
         .contains("GROK_SEARCH_API_KEY"));
+}
+
+#[test]
+fn brave_engine_starts_without_grok_configuration() {
+    // The default engine never calls Grok, so a missing Grok key must not
+    // stop the server from starting.
+    let cfg = llm_search::config::Config::from_env_map([("BRAVE_API_KEY", "brave-test-key")]);
+    assert!(SearchService::new(cfg).is_ok());
+
+    let empty = llm_search::config::Config::from_env_map([] as [(&str, &str); 0]);
+    assert!(SearchService::new(empty).is_ok());
 }
 
 #[tokio::test]
@@ -865,19 +876,19 @@ impl SourceProvider for FailingSourceProvider {
         _max_results: usize,
         _filters: &SearchFilters,
     ) -> Result<Vec<Source>> {
-        Err(grok_search_rs::error::GrokSearchError::Provider(
+        Err(llm_search::error::GrokSearchError::Provider(
             "source failed".to_string(),
         ))
     }
 
     async fn fetch(&self, _url: &str) -> Result<FetchedPage> {
-        Err(grok_search_rs::error::GrokSearchError::Provider(
+        Err(llm_search::error::GrokSearchError::Provider(
             "fetch failed".to_string(),
         ))
     }
 
     async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
-        Err(grok_search_rs::error::GrokSearchError::Provider(
+        Err(llm_search::error::GrokSearchError::Provider(
             "map failed".to_string(),
         ))
     }

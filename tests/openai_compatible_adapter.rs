@@ -1,5 +1,5 @@
-use grok_search_rs::adapters::chat_completions_request::to_chat_completions_payload;
-use grok_search_rs::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
+use llm_search::adapters::chat_completions_request::to_chat_completions_payload;
+use llm_search::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
 use serde_json::json;
 
 fn sample_request() -> SearchRequest {
@@ -42,7 +42,7 @@ fn user_system_overrides_default_hint() {
     assert_eq!(payload["messages"][0]["content"], "You are a cat.");
 }
 
-use grok_search_rs::adapters::chat_completions_response::parse_chat_completions;
+use llm_search::adapters::chat_completions_response::parse_chat_completions;
 
 #[test]
 fn extracts_openai_style_annotations() {
@@ -134,7 +134,7 @@ fn errors_when_content_empty_and_no_sources() {
     assert!(parse_chat_completions(&raw).is_err());
 }
 
-use grok_search_rs::providers::openai_compatible::OpenAICompatProvider;
+use llm_search::providers::openai_compatible::OpenAICompatProvider;
 use std::time::Duration;
 
 #[test]
@@ -249,8 +249,8 @@ fn inline_scanner_recovers_after_malformed_citation() {
     assert!(urls.contains(&"https://ok.example/b"), "got {urls:?}");
 }
 
-use grok_search_rs::error::Result as GrokResult;
-use grok_search_rs::model::search::SearchResponse;
+use llm_search::error::Result as GrokResult;
+use llm_search::model::search::SearchResponse;
 
 fn fake_provider_search(_req: &SearchRequest) -> GrokResult<SearchResponse> {
     Ok(SearchResponse {
@@ -264,7 +264,7 @@ fn provider_request_model_overrides_self_model() {
     // P1 fix: When SearchRequest.model is non-empty it must take precedence
     // over the provider default. We assert the payload built for the wire,
     // since search() itself is async + I/O-bound.
-    use grok_search_rs::adapters::chat_completions_request::to_chat_completions_payload;
+    use llm_search::adapters::chat_completions_request::to_chat_completions_payload;
 
     let mut req = sample_request();
     req.model = "grok-4-1-fast-reasoning".into();

@@ -1,13 +1,13 @@
-use grok_search_rs::sources::arxiv::{render as arxiv_render, ArxivExtractor};
-use grok_search_rs::sources::github::{
+use llm_search::sources::arxiv::{render as arxiv_render, ArxivExtractor};
+use llm_search::sources::github::{
     parse_release as gh_parse_release, render as gh_render, render_release as gh_render_release,
     GithubIssueExtractor, GithubPrExtractor, GithubRaw, GithubReleaseExtractor, GithubReleaseRaw,
 };
-use grok_search_rs::sources::stackexchange::{render as se_render, SeRaw, StackExchangeExtractor};
-use grok_search_rs::sources::wikipedia::{
+use llm_search::sources::stackexchange::{render as se_render, SeRaw, StackExchangeExtractor};
+use llm_search::sources::wikipedia::{
     parse_page as wiki_parse_page, render as wiki_render, WikiRaw, WikipediaExtractor,
 };
-use grok_search_rs::sources::{SourceCaps, SourceExtractor};
+use llm_search::sources::{SourceCaps, SourceExtractor};
 use url::Url;
 
 fn issue_fixture() -> GithubRaw {

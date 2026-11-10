@@ -55,6 +55,8 @@ const HTTP_PROTOCOL_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 /// environment. Stripped from the operator base env once at startup so a stray
 /// server-side key can never leak into a tenant's request.
 const SECRET_ENV_KEYS: &[&str] = &[
+    "BRAVE_API_KEY",
+    "BRAVE_SEARCH_API_KEY",
     "GROK_SEARCH_API_KEY",
     "TAVILY_API_KEY",
     "FIRECRAWL_API_KEY",
@@ -71,6 +73,7 @@ const SECRET_ENV_KEYS: &[&str] = &[
 /// Request header -> config env key overlay. Header names match on a
 /// case-insensitive basis (axum lowercases header names).
 const HEADER_TO_ENV: &[(&str, &str)] = &[
+    ("x-brave-api-key", "BRAVE_API_KEY"),
     ("x-grok-api-key", "GROK_SEARCH_API_KEY"),
     ("x-tavily-api-key", "TAVILY_API_KEY"),
     ("x-firecrawl-api-key", "FIRECRAWL_API_KEY"),
@@ -139,7 +142,7 @@ pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> an
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    eprintln!("grok-search-rs: Streamable HTTP transport listening on http://{bind}/mcp");
+    eprintln!("llm-search: Streamable HTTP transport listening on http://{bind}/mcp");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -613,10 +616,10 @@ fn warn_ignored_secret_env(env: &HashMap<String, String>) {
         }
         match header_for_env(key) {
             Some(header) => eprintln!(
-                "grok-search-rs: {key} is set in the server environment but the HTTP transport ignores it — callers must send the {header} request header instead"
+                "llm-search: {key} is set in the server environment but the HTTP transport ignores it — callers must send the {header} request header instead"
             ),
             None => eprintln!(
-                "grok-search-rs: {key} is set in the server environment but the HTTP transport ignores it"
+                "llm-search: {key} is set in the server environment but the HTTP transport ignores it"
             ),
         }
     }

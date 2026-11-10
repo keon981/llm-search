@@ -7,11 +7,11 @@
 //! get the rest.
 
 use async_trait::async_trait;
-use grok_search_rs::error::Result;
-use grok_search_rs::model::search::SearchFilters;
-use grok_search_rs::model::source::{FetchedPage, Source};
-use grok_search_rs::model::tool::WebSearchInput;
-use grok_search_rs::service::{SearchService, SourceProvider};
+use llm_search::error::Result;
+use llm_search::model::search::SearchFilters;
+use llm_search::model::source::{FetchedPage, Source};
+use llm_search::model::tool::WebSearchInput;
+use llm_search::service::{SearchService, SourceProvider};
 
 /// Supplemental provider whose generic fetch returns a body of fixed length,
 /// so per-source inline content size is deterministic.

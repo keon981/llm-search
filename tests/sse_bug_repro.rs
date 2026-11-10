@@ -4,8 +4,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-use grok_search_rs::adapters::chat_completions_response::parse_chat_completions;
-use grok_search_rs::providers::http::{build_client, post_json};
+use llm_search::adapters::chat_completions_response::parse_chat_completions;
+use llm_search::providers::http::{build_client, post_json};
 use serde_json::json;
 
 async fn spawn_sse_server(expected_stream: bool, chunks: Vec<Vec<u8>>) -> String {

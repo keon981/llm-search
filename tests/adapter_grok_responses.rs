@@ -1,6 +1,6 @@
-use grok_search_rs::adapters::grok_responses_request::to_grok_responses_payload;
-use grok_search_rs::adapters::grok_responses_response::parse_grok_responses;
-use grok_search_rs::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
+use llm_search::adapters::grok_responses_request::to_grok_responses_payload;
+use llm_search::adapters::grok_responses_response::parse_grok_responses;
+use llm_search::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
 
 fn sample_request() -> SearchRequest {
     SearchRequest {

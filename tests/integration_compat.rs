@@ -9,8 +9,8 @@
 //! The probe asserts a non-empty response and at least one source. Use it as a
 //! contract regression check when swapping gateways or upgrading providers.
 
-use grok_search_rs::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
-use grok_search_rs::providers::openai_compatible::OpenAICompatProvider;
+use llm_search::model::search::{ContentBlock, SearchMessage, SearchRequest, SearchTool};
+use llm_search::providers::openai_compatible::OpenAICompatProvider;
 use std::time::Duration;
 
 #[tokio::test(flavor = "current_thread")]

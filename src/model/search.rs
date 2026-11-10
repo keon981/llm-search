@@ -58,6 +58,68 @@ pub struct SearchResponse {
     pub sources: Vec<crate::model::source::Source>,
 }
 
+/// Search depth for providers that offer more than one (Tavily).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchDepth {
+    #[default]
+    Basic,
+    Advanced,
+}
+
+impl SearchDepth {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SearchDepth::Basic => "basic",
+            SearchDepth::Advanced => "advanced",
+        }
+    }
+}
+
+/// Router-mode search options. Providers that cannot honor a field ignore it;
+/// `SourceProvider::search_detailed`'s default does exactly that.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SearchOptions {
+    pub depth: SearchDepth,
+    /// Ask the provider for its own generated answer (Tavily `include_answer`).
+    pub include_answer: bool,
+    /// Ask for page text inline with each result (Tavily `include_raw_content`).
+    pub include_raw_content: bool,
+    /// Per-result cap on inline page text; 0 means no cap.
+    pub raw_content_max_chars: usize,
+}
+
+/// Result of a router-mode search: sources plus an optional provider answer.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DetailedSearch {
+    pub answer: Option<String>,
+    pub sources: Vec<crate::model::source::Source>,
+}
+
+/// Output format for page extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExtractFormat {
+    #[default]
+    Markdown,
+    Text,
+}
+
+impl ExtractFormat {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ExtractFormat::Markdown => "markdown",
+            ExtractFormat::Text => "text",
+        }
+    }
+}
+
+/// `web_fetch` options passed to the provider that extracts the page.
+/// `depth: None` keeps the provider's default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FetchOptions {
+    pub depth: Option<SearchDepth>,
+    pub format: ExtractFormat,
+}
+
 /// Structured retrieval filters shared by source providers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SearchFilters {

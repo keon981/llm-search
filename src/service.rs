@@ -5,14 +5,19 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 use crate::cache::SourceCache;
-use crate::config::{AuthMode, Config};
+use crate::config::{AuthMode, Config, SearchEngine};
 use crate::credentials::{OAuthCredential, StaticApiKeyCredential};
 use crate::error::{GrokSearchError, Result};
 use crate::model::search::{
-    ContentBlock, SearchFilters, SearchMessage, SearchRequest, SearchResponse, SearchTool,
+    ContentBlock, DetailedSearch, FetchOptions, SearchFilters, SearchMessage, SearchOptions,
+    SearchRequest, SearchResponse, SearchTool,
 };
 use crate::model::source::{is_junk_title, merge_sources, FetchedPage, Source};
-use crate::model::tool::{GetSourcesOutput, WebFetchOutput, WebSearchInput, WebSearchOutput};
+use crate::model::tool::{
+    FetchFailure, GetSourcesOutput, SearchFallback, SourceLogEntry, WebFetchBatchOutput,
+    WebFetchOutput, WebSearchInput, WebSearchOutput,
+};
+use crate::providers::brave::BraveProvider;
 use crate::providers::exa::ExaProvider;
 use crate::providers::firecrawl::FirecrawlProvider;
 use crate::providers::grok::GrokResponsesProvider;
@@ -34,6 +39,27 @@ pub trait SourceProvider: Send + Sync {
     ) -> Result<Vec<Source>>;
     async fn fetch(&self, url: &str) -> Result<FetchedPage>;
     async fn map(&self, url: &str, max_results: usize) -> Result<Vec<Source>>;
+
+    /// Router-mode search. Providers with no depth / answer / inline-text
+    /// options (all but Tavily) serve a plain search and no answer.
+    async fn search_detailed(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+        _options: &SearchOptions,
+    ) -> Result<DetailedSearch> {
+        Ok(DetailedSearch {
+            answer: None,
+            sources: self.search_sources(query, max_results, filters).await?,
+        })
+    }
+
+    /// `web_fetch` with extraction options. Providers with no depth / format
+    /// options (all but Tavily) ignore them.
+    async fn fetch_with(&self, url: &str, _options: &FetchOptions) -> Result<FetchedPage> {
+        self.fetch(url).await
+    }
 }
 
 #[async_trait]
@@ -67,6 +93,46 @@ impl SourceProvider for TavilyProvider {
 
     async fn map(&self, url: &str, max_results: usize) -> Result<Vec<Source>> {
         self.map(url, max_results).await
+    }
+
+    async fn search_detailed(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+        options: &SearchOptions,
+    ) -> Result<DetailedSearch> {
+        self.search_with(query, max_results, filters, options).await
+    }
+
+    async fn fetch_with(&self, url: &str, options: &FetchOptions) -> Result<FetchedPage> {
+        self.extract_with(url, options).await
+    }
+}
+
+#[async_trait]
+impl SourceProvider for BraveProvider {
+    async fn search_sources(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+    ) -> Result<Vec<Source>> {
+        self.search(query, max_results, filters).await
+    }
+
+    async fn fetch(&self, _url: &str) -> Result<FetchedPage> {
+        // Never routed here (BRAVE_SPEC.supports_fetch is false); kept as an
+        // explicit error rather than a silent empty page.
+        Err(GrokSearchError::Provider(
+            "Brave Search has no page-fetch endpoint".to_string(),
+        ))
+    }
+
+    async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
+        Err(GrokSearchError::Provider(
+            "Brave Search has no site-map endpoint".to_string(),
+        ))
     }
 }
 
@@ -153,6 +219,9 @@ pub(crate) struct ProviderSpec {
     supports_filters: bool,
     /// Whether the provider exposes a real site-map endpoint (`web_map`).
     supports_map: bool,
+    /// Whether the provider can fetch a page (`web_fetch`, inline
+    /// enrichment). Search-only providers (Brave) are skipped there.
+    supports_fetch: bool,
     /// Core providers appear in zero-source diagnostics even when
     /// unconfigured; optional ones are mentioned only when the operator names
     /// them in `GROK_SEARCH_SOURCE_PROVIDERS`. Keeps "I never set up Exa"
@@ -168,6 +237,7 @@ const TAVILY_SPEC: ProviderSpec = ProviderSpec {
     header: "x-tavily-api-key",
     supports_filters: true,
     supports_map: true,
+    supports_fetch: true,
     core: true,
 };
 
@@ -179,6 +249,7 @@ const EXA_SPEC: ProviderSpec = ProviderSpec {
     header: "x-exa-api-key",
     supports_filters: true,
     supports_map: false,
+    supports_fetch: true,
     core: false,
 };
 
@@ -190,6 +261,7 @@ const TINYFISH_SPEC: ProviderSpec = ProviderSpec {
     header: "x-tinyfish-api-key",
     supports_filters: true,
     supports_map: false,
+    supports_fetch: true,
     core: false,
 };
 
@@ -201,16 +273,41 @@ const FIRECRAWL_SPEC: ProviderSpec = ProviderSpec {
     header: "x-firecrawl-api-key",
     supports_filters: false,
     supports_map: false,
+    supports_fetch: true,
     core: true,
+};
+
+/// Brave Search: search only (no fetch, no map). Domain/recency filters are
+/// honored via `freshness`, `site:` operators, and a host post-filter.
+/// Not `core`: an unconfigured Brave is not a chain gap in Grok mode, and the
+/// router reports it on its own terms.
+const BRAVE_SPEC: ProviderSpec = ProviderSpec {
+    name: "brave",
+    display: "Brave",
+    enable_var: "BRAVE_ENABLED",
+    key_var: "BRAVE_API_KEY",
+    header: "x-brave-api-key",
+    supports_filters: true,
+    supports_map: false,
+    supports_fetch: false,
+    core: false,
 };
 
 /// Canonical chain order. Tavily's RAG-tuned results keep the primary slot;
 /// Exa (semantic search, native filter support) outranks the keyword engines
 /// among the newcomers; TinyFish is the free keyword/fetch tier; Firecrawl
-/// keeps its historical last-resort slot because its search cannot honor
-/// filters. `GROK_SEARCH_SOURCE_PROVIDERS` overrides this order entirely.
-const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 4] =
-    [&TAVILY_SPEC, &EXA_SPEC, &TINYFISH_SPEC, &FIRECRAWL_SPEC];
+/// keeps its historical last-resort slot among the fetch-capable providers
+/// because its search cannot honor filters. Brave sits last so Grok mode's
+/// enrichment/fallback behaves exactly as before unless every other provider
+/// came up empty; router mode (`LLM_SEARCH_PROVIDER=brave`) sets its own
+/// order. `GROK_SEARCH_SOURCE_PROVIDERS` overrides this order entirely.
+const CANONICAL_SOURCE_ORDER: [&ProviderSpec; 5] = [
+    &TAVILY_SPEC,
+    &EXA_SPEC,
+    &TINYFISH_SPEC,
+    &FIRECRAWL_SPEC,
+    &BRAVE_SPEC,
+];
 
 /// One instantiated provider in the source chain.
 #[derive(Clone)]
@@ -282,6 +379,17 @@ fn instantiate_source(
                     key,
                 )) as Arc<dyn SourceProvider>
             }),
+        "brave" => config
+            .brave_enabled
+            .then(|| config.brave_api_key.clone())
+            .flatten()
+            .map(|key| {
+                Arc::new(BraveProvider::with_client(
+                    http.clone(),
+                    config.brave_api_url.clone(),
+                    key,
+                )) as Arc<dyn SourceProvider>
+            }),
         _ => None,
     }
 }
@@ -292,6 +400,19 @@ fn provider_enabled(spec: &ProviderSpec, config: &Config) -> bool {
         "exa" => config.exa_enabled,
         "tinyfish" => config.tinyfish_enabled,
         "firecrawl" => config.firecrawl_enabled,
+        "brave" => config.brave_enabled,
+        _ => false,
+    }
+}
+
+/// Whether `spec`'s key is configured, independent of its enable flag.
+fn provider_key_set(spec: &ProviderSpec, config: &Config) -> bool {
+    match spec.name {
+        "tavily" => config.tavily_api_key.is_some(),
+        "exa" => config.exa_api_key.is_some(),
+        "tinyfish" => config.tinyfish_api_key.is_some(),
+        "firecrawl" => config.firecrawl_api_key.is_some(),
+        "brave" => config.brave_api_key.is_some(),
         _ => false,
     }
 }
@@ -312,7 +433,7 @@ pub fn validate_source_providers(config: &Config) -> Result<()> {
     for name in &config.source_providers {
         if !CANONICAL_SOURCE_ORDER.iter().any(|spec| spec.name == name) {
             return Err(GrokSearchError::InvalidParams(format!(
-                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, firecrawl)"
+                "unknown source provider \"{name}\" in GROK_SEARCH_SOURCE_PROVIDERS (valid: tavily, exa, tinyfish, firecrawl, brave)"
             )));
         }
     }
@@ -354,7 +475,11 @@ fn build_source_slots(config: &Config, http: &reqwest::Client) -> Result<Vec<Sou
 #[derive(Clone)]
 pub struct SearchService {
     config: Config,
-    ai: Arc<dyn AiProvider>,
+    /// The Grok / OpenAI-compatible answer provider. Required in Grok mode;
+    /// optional in router mode, where it is never called (`None` when its
+    /// config is absent or invalid — `ai_unavailable` says why).
+    ai: Option<Arc<dyn AiProvider>>,
+    ai_unavailable: Option<String>,
     /// Model name written into every `SearchRequest` produced by the service.
     /// Resolved once from `config` at construction so each transport gets the
     /// model it actually understands: `grok_model` for Responses, and
@@ -381,7 +506,8 @@ pub struct SearchService {
 /// (the stdio path), and [`SearchService::with_config`] uses it per request
 /// while sharing the long-lived HTTP client and source cache.
 struct ProviderSet {
-    ai: Arc<dyn AiProvider>,
+    ai: Option<Arc<dyn AiProvider>>,
+    ai_unavailable: Option<String>,
     default_model: String,
     source_slots: Vec<SourceSlot>,
     source_router: Arc<crate::sources::SourceRouter>,
@@ -406,6 +532,35 @@ fn build_providers_with_grok(
     http: &reqwest::Client,
     grok_http: &reqwest::Client,
 ) -> Result<ProviderSet> {
+    // Grok mode cannot run without its answer provider, so a missing key
+    // fails construction exactly as before. Router mode never calls it: a
+    // missing or broken Grok config is recorded for `doctor` instead.
+    let (ai, ai_unavailable) = match build_ai_provider(config, http, grok_http) {
+        Ok(ai) => (Some(ai), None),
+        Err(err) if config.search_engine == SearchEngine::Grok => return Err(err),
+        Err(err) => (None, Some(err.to_string())),
+    };
+
+    let source_slots = build_source_slots(config, http)?;
+
+    let source_router = Arc::new(crate::sources::SourceRouter::from_config(config));
+
+    Ok(ProviderSet {
+        ai,
+        ai_unavailable,
+        default_model: resolve_default_model(config),
+        source_slots,
+        source_router,
+    })
+}
+
+/// Build the Grok Responses or OpenAI-compatible answer provider from
+/// `config`. Errors name the missing setting.
+fn build_ai_provider(
+    config: &Config,
+    http: &reqwest::Client,
+    grok_http: &reqwest::Client,
+) -> Result<Arc<dyn AiProvider>> {
     use crate::config::Transport;
 
     let ai: Arc<dyn AiProvider> = match config.transport {
@@ -455,7 +610,7 @@ fn build_providers_with_grok(
                 .unwrap_or_else(|| config.grok_model.clone());
             if config.x_search_enabled {
                 eprintln!(
-                    "grok-search-rs: x_search_enabled is ignored when using OPENAI_COMPATIBLE_* transport"
+                    "llm-search: x_search_enabled is ignored when using OPENAI_COMPATIBLE_* transport"
                 );
             }
             Arc::new(
@@ -469,17 +624,7 @@ fn build_providers_with_grok(
             )
         }
     };
-
-    let source_slots = build_source_slots(config, http)?;
-
-    let source_router = Arc::new(crate::sources::SourceRouter::from_config(config));
-
-    Ok(ProviderSet {
-        ai,
-        default_model: resolve_default_model(config),
-        source_slots,
-        source_router,
-    })
+    Ok(ai)
 }
 
 /// Non-reversible per-tenant namespace tag derived from the caller's primary
@@ -583,10 +728,16 @@ impl SearchService {
             default_model: providers.default_model,
             config,
             ai: providers.ai,
+            ai_unavailable: providers.ai_unavailable,
             source_slots: Arc::new(providers.source_slots),
             http_client: http,
             source_router: providers.source_router,
         }
+    }
+
+    /// Every configured secret value, for redaction at the MCP boundary.
+    pub fn secret_values(&self) -> Vec<String> {
+        self.config.secret_values()
     }
 
     /// Instantiated providers from the chain, in chain order.
@@ -610,6 +761,7 @@ impl SearchService {
 
     pub fn fake_with_sources() -> Self {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "fake-grok"),
             ("TAVILY_API_KEY", "fake-tavily"),
         ]);
@@ -618,7 +770,8 @@ impl SearchService {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(vec![
                 SourceSlot::Active(SourceEntry {
                     spec: &TAVILY_SPEC,
@@ -675,6 +828,7 @@ impl SearchService {
         V: Into<String>,
     {
         let mut vars = vec![
+            ("LLM_SEARCH_PROVIDER".to_string(), "grok".to_string()),
             ("GROK_SEARCH_API_KEY".to_string(), "fake-grok".to_string()),
             ("TAVILY_API_KEY".to_string(), "fake-tavily".to_string()),
         ];
@@ -696,7 +850,8 @@ impl SearchService {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
             default_model: resolve_default_model(&config),
             config,
-            ai: ai.unwrap_or_else(|| Arc::new(FakeAiProvider)),
+            ai: Some(ai.unwrap_or_else(|| Arc::new(FakeAiProvider))),
+            ai_unavailable: None,
             source_slots,
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(crate::sources::SourceRouter::default()),
@@ -712,6 +867,7 @@ impl SearchService {
         router: crate::sources::SourceRouter,
     ) -> Self {
         let mut vars = vec![
+            ("LLM_SEARCH_PROVIDER".to_string(), "grok".to_string()),
             ("GROK_SEARCH_API_KEY".to_string(), "fake-grok".to_string()),
             ("TAVILY_API_KEY".to_string(), "fake-tavily".to_string()),
         ];
@@ -727,14 +883,53 @@ impl SearchService {
             cache: Arc::new(Mutex::new(SourceCache::new(256))),
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots,
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
             source_router: Arc::new(router),
         }
     }
 
+    /// `web_search` entry point: the Brave / Tavily router by default, the
+    /// original Grok pipeline when `LLM_SEARCH_PROVIDER=grok`.
     pub async fn web_search(&self, input: WebSearchInput) -> Result<WebSearchOutput> {
+        match self.config.search_engine {
+            SearchEngine::Brave => self.router_search(input).await,
+            SearchEngine::Grok => {
+                let mut warnings = Vec::new();
+                if input.mode.is_some() {
+                    warnings.push(
+                        "mode is ignored when LLM_SEARCH_PROVIDER=grok (router modes need LLM_SEARCH_PROVIDER=brave)"
+                            .to_string(),
+                    );
+                }
+                if input.max_results.is_some() {
+                    warnings.push(
+                        "max_results is ignored when LLM_SEARCH_PROVIDER=grok (use extra_sources)"
+                            .to_string(),
+                    );
+                }
+                let query = input.query.clone();
+                let mut output = self.grok_search(input).await?;
+                output.source_log = build_source_log(&output.sources, Some(&query));
+                output.warnings = warnings;
+                Ok(output)
+            }
+        }
+    }
+
+    /// The original GrokSearch-rs pipeline: Grok answers, the source chain
+    /// enriches or (when Grok is unusable) replaces it.
+    async fn grok_search(&self, input: WebSearchInput) -> Result<WebSearchOutput> {
+        let ai = self.ai.clone().ok_or_else(|| {
+            GrokSearchError::Provider(format!(
+                "LLM_SEARCH_PROVIDER=grok but the Grok provider is unavailable: {}",
+                self.ai_unavailable
+                    .as_deref()
+                    .unwrap_or("no Grok configuration")
+            ))
+        })?;
         // D-02: single global deadline shared by Grok + supplemental fetch + enrichment.
         let deadline = tokio::time::Instant::now() + self.config.timeout;
         // response_format (Anthropic tool-design guidance: concise|detailed)
@@ -777,7 +972,7 @@ impl SearchService {
         let speculative_count = effective_extra_sources.max(self.config.fallback_sources);
         let request = self.build_search_request(&input, &[]);
 
-        let grok_future = self.ai.search(&request);
+        let grok_future = ai.search(&request);
         let speculative_future =
             self.fetch_raw_extra_sources(&input.query, speculative_count, &filters, deadline);
         let (grok_result, raw) = tokio::join!(grok_future, speculative_future);
@@ -859,7 +1054,263 @@ impl SearchService {
             fallback_used: false,
             fallback_reason: None,
             truncated,
+            engine: SearchEngine::Grok.as_str().to_string(),
+            mode: None,
+            answer: None,
+            fallbacks: Vec::new(),
+            notice: None,
+            source_log: Vec::new(),
+            warnings: Vec::new(),
         })
+    }
+
+    /// Brave / Tavily router (`LLM_SEARCH_PROVIDER=brave`), after the search
+    /// router of deepseek-harness-web-search-plugin:
+    ///
+    /// - `quick` (default): Brave, then Tavily, then the rest of the chain.
+    /// - `deep`: Tavily (advanced depth, provider answer, inline page text),
+    ///   then Brave, then the rest of the chain.
+    /// - `verify`: Brave and Tavily in parallel, merged by URL; the rest of
+    ///   the chain only when both fail.
+    ///
+    /// Every provider tried before the one that served the result is listed
+    /// in `fallbacks`, and `notice` asks the caller to disclose it.
+    async fn router_search(&self, input: WebSearchInput) -> Result<WebSearchOutput> {
+        let deadline = tokio::time::Instant::now() + self.config.timeout;
+        let mode = RouterMode::parse(input.mode.as_deref())?;
+        let query = input.query.trim().to_string();
+        if query.is_empty() {
+            return Err(GrokSearchError::InvalidParams(
+                "web_search.query is required".to_string(),
+            ));
+        }
+        let max_results = input
+            .max_results
+            .unwrap_or(ROUTER_DEFAULT_RESULTS)
+            .clamp(1, ROUTER_MAX_RESULTS);
+        // Router results are snippets (or Tavily page text in deep/verify);
+        // fetching pages for them is opt-in, unlike Grok mode.
+        let include_content = match input.response_format.as_deref() {
+            None => input.include_content.unwrap_or(false),
+            Some("concise") => false,
+            Some("detailed") => true,
+            Some(other) => {
+                return Err(GrokSearchError::InvalidParams(format!(
+                    "response_format must be \"concise\" or \"detailed\", got \"{other}\""
+                )))
+            }
+        };
+        let filters = SearchFilters {
+            recency_days: input.recency_days,
+            include_domains: input.include_domains.clone(),
+            exclude_domains: input.exclude_domains.clone(),
+        };
+        let mut warnings = Vec::new();
+        if input.extra_sources.is_some() {
+            warnings.push(
+                "extra_sources is ignored when LLM_SEARCH_PROVIDER=brave (use max_results)"
+                    .to_string(),
+            );
+        }
+
+        let active = self.active_sources();
+        let find = |name: &str| active.iter().find(|entry| entry.spec.name == name).cloned();
+        let brave = find("brave");
+        let tavily = find("tavily");
+        let rest: Vec<SourceEntry> = active
+            .iter()
+            .filter(|entry| !matches!(entry.spec.name, "brave" | "tavily"))
+            .cloned()
+            .collect();
+        if brave.is_none() && tavily.is_none() && rest.is_empty() {
+            return Err(GrokSearchError::MissingConfig(
+                "BRAVE_API_KEY and/or TAVILY_API_KEY (web_search has no search provider configured)",
+            ));
+        }
+
+        let mut fallbacks: Vec<SearchFallback> = Vec::new();
+        let served = match mode {
+            RouterMode::Quick | RouterMode::Deep => {
+                let primary = if mode == RouterMode::Quick {
+                    [brave, tavily]
+                } else {
+                    [tavily, brave]
+                };
+                let order: Vec<SourceEntry> = primary.into_iter().flatten().chain(rest).collect();
+                router_first_hit(
+                    &order,
+                    &query,
+                    max_results,
+                    &filters,
+                    mode,
+                    deadline,
+                    &mut fallbacks,
+                )
+                .await
+            }
+            RouterMode::Verify => {
+                let (brave_attempt, tavily_attempt) = tokio::join!(
+                    router_attempt_opt(
+                        brave.as_ref(),
+                        &query,
+                        max_results,
+                        &filters,
+                        mode,
+                        deadline
+                    ),
+                    router_attempt_opt(
+                        tavily.as_ref(),
+                        &query,
+                        max_results,
+                        &filters,
+                        mode,
+                        deadline
+                    ),
+                );
+                let mut successes: Vec<(&'static str, DetailedSearch)> = Vec::new();
+                for attempt in [brave_attempt, tavily_attempt].into_iter().flatten() {
+                    match attempt {
+                        (name, Ok(found)) => successes.push((name, found)),
+                        (name, Err(error)) => fallbacks.push(SearchFallback {
+                            provider: name.to_string(),
+                            error,
+                        }),
+                    }
+                }
+                if successes.is_empty() {
+                    router_first_hit(
+                        &rest,
+                        &query,
+                        max_results,
+                        &filters,
+                        mode,
+                        deadline,
+                        &mut fallbacks,
+                    )
+                    .await
+                } else {
+                    let label = if successes.len() > 1 {
+                        "mixed".to_string()
+                    } else {
+                        successes[0].0.to_string()
+                    };
+                    let answer = successes
+                        .iter()
+                        .filter_map(|(_, found)| found.answer.clone())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    let mut merged: Vec<Source> = Vec::new();
+                    for (_, found) in successes {
+                        merged = merge_sources(merged, found.sources);
+                    }
+                    merged.truncate(max_results);
+                    Some((
+                        label,
+                        DetailedSearch {
+                            answer: (!answer.trim().is_empty()).then_some(answer),
+                            sources: merged,
+                        },
+                    ))
+                }
+            }
+        };
+
+        let Some((provider_label, found)) = served else {
+            let detail = fallbacks
+                .iter()
+                .map(|entry| format!("{}: {}", entry.provider, entry.error))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(GrokSearchError::Provider(format!(
+                "all search providers failed ({detail})"
+            )));
+        };
+
+        let DetailedSearch { answer, sources } = found;
+        let sources = if include_content {
+            self.enrich_missing_content(sources, deadline).await
+        } else {
+            sources
+        };
+
+        let mut uuid_buf = [0u8; uuid::fmt::Simple::LENGTH];
+        let session_id = {
+            let encoded = Uuid::new_v4().simple().encode_lower(&mut uuid_buf);
+            encoded[..12].to_string()
+        };
+        let sources_arc = Arc::new(sources);
+        let sources_count = sources_arc.len();
+        let cache_key = self.tenant_cache_key(&session_id);
+        self.cache.lock().await.set(cache_key, sources_arc.clone());
+
+        let content =
+            render_router_content(&provider_label, mode, sources_count, answer.as_deref());
+        let mut out_sources = (*sources_arc).clone();
+        let truncated = apply_response_budget(
+            content.chars().count(),
+            &mut out_sources,
+            self.config.response_max_chars,
+            &session_id,
+        );
+        let source_log = build_source_log(&out_sources, Some(&query));
+        let notice = fallback_notice(&fallbacks);
+
+        Ok(WebSearchOutput {
+            session_id,
+            content,
+            sources_count,
+            sources: out_sources,
+            search_provider: provider_label,
+            fallback_used: !fallbacks.is_empty(),
+            fallback_reason: fallbacks.first().map(fallback_reason_id),
+            truncated,
+            engine: SearchEngine::Brave.as_str().to_string(),
+            mode: Some(mode.as_str().to_string()),
+            answer,
+            fallbacks,
+            notice,
+            source_log,
+            warnings,
+        })
+    }
+
+    /// Inline page content for the sources that do not already carry it
+    /// (Tavily deep results do), through the same specialist + source-chain
+    /// pipeline as Grok-mode enrichment.
+    async fn enrich_missing_content(
+        &self,
+        sources: Vec<Source>,
+        deadline: tokio::time::Instant,
+    ) -> Vec<Source> {
+        let (missing_idx, missing): (Vec<usize>, Vec<Source>) = sources
+            .iter()
+            .enumerate()
+            .filter(|(_, source)| source.content.is_none())
+            .map(|(idx, source)| (idx, source.clone()))
+            .unzip();
+        if missing.is_empty() {
+            return sources;
+        }
+        let enriched = enrich_sources(
+            missing,
+            deadline,
+            &self.http_client,
+            &self.source_router,
+            crate::sources::SourceCaps {
+                max_answers: self.config.source_max_answers,
+                max_comments: self.config.source_max_comments,
+            },
+            self.config.enrich_concurrency,
+            self.config.enrich_max_chars,
+            self.config.max_inline_sources,
+            self.active_sources(),
+        )
+        .await;
+        let mut out = sources;
+        for (idx, source) in missing_idx.into_iter().zip(enriched) {
+            out[idx] = source;
+        }
+        out
     }
 
     /// Fetch sources by walking the configured provider chain in order; the
@@ -926,7 +1377,7 @@ impl SearchService {
                             Ok(usable) => {
                                 if !notes.is_empty() {
                                     eprintln!(
-                                        "grok-search-rs: source chain fell through to {name} ({})",
+                                        "llm-search: source chain fell through to {name} ({})",
                                         source_diagnosis(&notes)
                                     );
                                 }
@@ -1078,6 +1529,7 @@ impl SearchService {
             &session_id,
         );
 
+        let serving = origin.unwrap_or("source chain");
         Ok(WebSearchOutput {
             session_id,
             content,
@@ -1087,6 +1539,18 @@ impl SearchService {
             fallback_used: true,
             fallback_reason: Some(reason.to_string()),
             truncated,
+            engine: SearchEngine::Grok.as_str().to_string(),
+            mode: None,
+            answer: None,
+            fallbacks: vec![SearchFallback {
+                provider: "grok".to_string(),
+                error: reason.to_string(),
+            }],
+            notice: Some(format!(
+                "Search provider fallback used: grok: {reason}; results come from {serving}. Disclose this if the answer relies on fallback results."
+            )),
+            source_log: Vec::new(),
+            warnings: Vec::new(),
         })
     }
 
@@ -1130,6 +1594,20 @@ impl SearchService {
     }
 
     pub async fn web_fetch(&self, url: &str, max_chars: Option<usize>) -> Result<WebFetchOutput> {
+        self.web_fetch_with(url, max_chars, &FetchOptions::default())
+            .await
+    }
+
+    /// Single-URL `web_fetch` with extraction options. `options` reach only
+    /// providers that honor them (Tavily `extract_depth` / `format`); a
+    /// specialist extractor (GitHub, StackExchange, arXiv, Wikipedia) ignores
+    /// them.
+    pub async fn web_fetch_with(
+        &self,
+        url: &str,
+        max_chars: Option<usize>,
+        options: &FetchOptions,
+    ) -> Result<WebFetchOutput> {
         let effective_limit = max_chars.or(self.config.fetch_max_chars);
         // D-02, as on the web_search path: one deadline for the whole call.
         // The specialist attempt and every generic-chain provider draw from
@@ -1137,7 +1615,7 @@ impl SearchService {
         // cannot spend a full GROK_SEARCH_TIMEOUT_SECONDS apiece.
         let deadline = tokio::time::Instant::now() + self.config.timeout;
 
-        let (content, source_type, fallback_reason) = match url::Url::parse(url) {
+        let (content, source_type, fallback_reason, provider) = match url::Url::parse(url) {
             Ok(parsed) => {
                 let caps = crate::sources::SourceCaps {
                     max_answers: self.config.source_max_answers,
@@ -1151,16 +1629,29 @@ impl SearchService {
                 );
                 match tokio::time::timeout_at(deadline, specialist).await {
                     // Specialist succeeded — keep its content and source type.
-                    Ok(Ok((content, kind))) => (content, kind, None),
+                    Ok(Ok((content, kind))) => {
+                        let label = source_type_label(&kind);
+                        (content, kind, None, label)
+                    }
                     // No specialist matched: go generic silently (D-01).
                     Ok(Err(reason)) if reason == crate::sources::NO_SPECIALIST_MATCH => {
-                        let generic = self.web_fetch_raw(url, deadline).await?;
-                        (generic, crate::sources::SourceType::Generic, None)
+                        let (generic, served) = self.web_fetch_raw(url, deadline, options).await?;
+                        (
+                            generic,
+                            crate::sources::SourceType::Generic,
+                            None,
+                            Some(served.to_string()),
+                        )
                     }
                     // Specialist matched but failed/empty: surface the reason (D-01).
                     Ok(Err(reason)) => {
-                        let generic = self.web_fetch_raw(url, deadline).await?;
-                        (generic, crate::sources::SourceType::Generic, Some(reason))
+                        let (generic, served) = self.web_fetch_raw(url, deadline, options).await?;
+                        (
+                            generic,
+                            crate::sources::SourceType::Generic,
+                            Some(reason),
+                            Some(served.to_string()),
+                        )
                     }
                     // The budget is gone, so the generic chain cannot run
                     // either — report the timeout instead of pretending there
@@ -1174,28 +1665,132 @@ impl SearchService {
             }
             // Malformed URL is not a specialist failure — go generic, no reason.
             Err(_) => {
-                let generic = self.web_fetch_raw(url, deadline).await?;
-                (generic, crate::sources::SourceType::Generic, None)
+                let (generic, served) = self.web_fetch_raw(url, deadline, options).await?;
+                (
+                    generic,
+                    crate::sources::SourceType::Generic,
+                    None,
+                    Some(served.to_string()),
+                )
             }
         };
 
-        Ok(apply_fetch_limit(
-            url,
-            content,
-            effective_limit,
-            source_type,
-            fallback_reason,
+        let out = apply_fetch_limit(url, content, effective_limit, source_type, fallback_reason);
+        Ok(finish_fetch_output(
+            out,
+            provider,
+            crate::clock::now_rfc3339(),
         ))
+    }
+
+    /// Fetch several URLs (the `urls` argument). Each URL runs the single-URL
+    /// pipeline; a failed URL is reported in `failed` instead of failing the
+    /// call. `max_chars` is one budget shared by all results, spent in input
+    /// order; it defaults to the response budget (GROK_SEARCH_RESPONSE_MAX_CHARS).
+    pub async fn web_fetch_batch(
+        &self,
+        urls: &[String],
+        max_chars: Option<usize>,
+        options: &FetchOptions,
+    ) -> Result<WebFetchBatchOutput> {
+        let sem = Arc::new(tokio::sync::Semaphore::new(
+            self.config.enrich_concurrency.max(1),
+        ));
+        let mut set: tokio::task::JoinSet<(usize, Result<WebFetchOutput>)> =
+            tokio::task::JoinSet::new();
+        for (idx, url) in urls.iter().enumerate() {
+            let service = self.clone();
+            let url = url.clone();
+            let options = *options;
+            let permit = Arc::clone(&sem);
+            set.spawn(async move {
+                let _permit = permit.acquire_owned().await.ok();
+                (idx, service.web_fetch_with(&url, None, &options).await)
+            });
+        }
+        let mut outcomes: Vec<(usize, Result<WebFetchOutput>)> = Vec::with_capacity(urls.len());
+        while let Some(joined) = set.join_next().await {
+            if let Ok(pair) = joined {
+                outcomes.push(pair);
+            }
+        }
+        outcomes.sort_by_key(|(idx, _)| *idx);
+
+        let mut remaining = max_chars.unwrap_or(self.config.response_max_chars);
+        let mut results = Vec::new();
+        let mut failed = Vec::new();
+        let mut source_log = Vec::new();
+        let mut truncated = false;
+        for (idx, outcome) in outcomes {
+            let url = &urls[idx];
+            let source_id = format!("src_{:03}", idx + 1);
+            match outcome {
+                Ok(page) => {
+                    let mut page = if page.content.chars().count() > remaining {
+                        truncated = true;
+                        let extracted_at = page.extracted_at.clone();
+                        let provider = page.provider.clone();
+                        let cut = apply_fetch_limit(
+                            &page.url,
+                            page.content,
+                            Some(remaining),
+                            page.source_type,
+                            page.fallback_reason,
+                        );
+                        finish_fetch_output(cut, provider, extracted_at)
+                    } else {
+                        page
+                    };
+                    remaining = remaining.saturating_sub(page.content.chars().count());
+                    for entry in &mut page.source_log {
+                        entry.source_id = source_id.clone();
+                    }
+                    source_log.append(&mut page.source_log);
+                    results.push(page);
+                }
+                Err(err) => {
+                    let error = crate::model::source::truncate_with_marker(
+                        &err.to_string(),
+                        FALLBACK_ERROR_CHARS,
+                    );
+                    source_log.push(SourceLogEntry {
+                        source_id,
+                        url: url.clone(),
+                        domain: domain_of(url),
+                        status: "failed".to_string(),
+                        ..SourceLogEntry::default()
+                    });
+                    failed.push(FetchFailure {
+                        url: url.clone(),
+                        error,
+                    });
+                }
+            }
+        }
+        Ok(WebFetchBatchOutput {
+            results,
+            failed,
+            source_log,
+            truncated,
+        })
     }
 
     /// Generic fetch through the source chain, bounded by the call's shared
     /// `deadline`. Mirrors how inline enrichment already wraps the same
     /// helper: without this, each chain position would get its own full
     /// client timeout and the chain would multiply the configured budget.
-    async fn web_fetch_raw(&self, url: &str, deadline: tokio::time::Instant) -> Result<String> {
+    /// Returns the content and the name of the provider that served it.
+    async fn web_fetch_raw(
+        &self,
+        url: &str,
+        deadline: tokio::time::Instant,
+        options: &FetchOptions,
+    ) -> Result<(String, &'static str)> {
         let chain = self.active_sources();
-        match tokio::time::timeout_at(deadline, generic_source_fetch(&chain, url)).await {
-            Ok(result) => result.map(|page| page.content),
+        match tokio::time::timeout_at(deadline, generic_source_fetch_with(&chain, url, options))
+            .await
+        {
+            Ok(result) => result.map(|(page, served)| (page.content, served)),
             Err(_elapsed) => Err(GrokSearchError::Timeout(format!(
                 "web_fetch timed out fetching {url} through the source chain (GROK_SEARCH_TIMEOUT_SECONDS)"
             ))),
@@ -1227,12 +1822,48 @@ impl SearchService {
     /// Runtime diagnostics with live connectivity probes against each configured backend.
     /// Returns provider availability flags, masked config, and per-provider reachability.
     pub async fn doctor(&self) -> serde_json::Value {
+        self.doctor_scoped(None)
+            .await
+            .expect("an unscoped doctor call cannot fail validation")
+    }
+
+    /// [`doctor`](Self::doctor) limited to one provider (`brave`, `tavily`,
+    /// `exa`, `tinyfish`, `firecrawl`, `grok`) or `all`. Providers outside the
+    /// scope are reported with status `not_checked` and make no request.
+    pub async fn doctor_scoped(&self, scope: Option<&str>) -> Result<serde_json::Value> {
         use crate::config::Transport;
-        let grok_probe = self.probe_grok().await;
-        let tavily_probe = self.probe_chain_source("tavily").await;
-        let exa_probe = self.probe_chain_source("exa").await;
-        let tinyfish_probe = self.probe_chain_source("tinyfish").await;
-        let firecrawl_probe = self.probe_chain_source("firecrawl").await;
+        let scope = scope.map(|s| s.trim().to_ascii_lowercase());
+        let scope = match scope.as_deref() {
+            None | Some("") | Some("all") => None,
+            Some(name @ ("brave" | "tavily" | "exa" | "tinyfish" | "firecrawl" | "grok")) => {
+                Some(name.to_string())
+            }
+            Some(other) => {
+                return Err(GrokSearchError::InvalidParams(format!(
+                    "doctor.provider must be one of all, brave, tavily, exa, tinyfish, firecrawl, grok; got \"{other}\""
+                )))
+            }
+        };
+        let in_scope = |name: &str| scope.as_deref().map_or(true, |only| only == name);
+        let grok_probe = if in_scope("grok") {
+            self.probe_grok().await
+        } else {
+            Probe::not_checked()
+        };
+        let mut chain_probes = std::collections::HashMap::new();
+        for name in ["brave", "tavily", "exa", "tinyfish", "firecrawl"] {
+            let probe = if in_scope(name) {
+                self.probe_chain_source(name).await
+            } else {
+                Probe::not_checked()
+            };
+            chain_probes.insert(name, probe);
+        }
+        let brave_probe = chain_probes.remove("brave").expect("probed");
+        let tavily_probe = chain_probes.remove("tavily").expect("probed");
+        let exa_probe = chain_probes.remove("exa").expect("probed");
+        let tinyfish_probe = chain_probes.remove("tinyfish").expect("probed");
+        let firecrawl_probe = chain_probes.remove("firecrawl").expect("probed");
         let source_chain: Vec<&str> = self
             .source_slots
             .iter()
@@ -1267,7 +1898,8 @@ impl SearchService {
             ),
         };
 
-        serde_json::json!({
+        Ok(serde_json::json!({
+            "engine": self.config.search_engine.as_str(),
             "provider": provider_label,
             "transport": provider_label,
             "grok": {
@@ -1285,19 +1917,30 @@ impl SearchService {
                     .unwrap_or_else(|| "unavailable".to_string()),
                 "web_search_enabled": self.config.web_search_enabled,
                 "x_search_enabled": ai_x_search_enabled,
+                "configured": self.ai.is_some(),
                 "reachable": grok_probe.ok,
+                "status": grok_probe.status(),
                 "detail": grok_probe.detail,
+            },
+            "brave": {
+                "api_url": self.config.brave_api_url,
+                "enabled": self.config.brave_enabled,
+                "reachable": brave_probe.ok,
+                "status": brave_probe.status(),
+                "detail": brave_probe.detail,
             },
             "tavily": {
                 "api_url": self.config.tavily_api_url,
                 "enabled": self.config.tavily_enabled,
                 "reachable": tavily_probe.ok,
+                "status": tavily_probe.status(),
                 "detail": tavily_probe.detail,
             },
             "exa": {
                 "api_url": self.config.exa_api_url,
                 "enabled": self.config.exa_enabled,
                 "reachable": exa_probe.ok,
+                "status": exa_probe.status(),
                 "detail": exa_probe.detail,
             },
             "tinyfish": {
@@ -1305,12 +1948,14 @@ impl SearchService {
                 "fetch_api_url": self.config.tinyfish_fetch_api_url,
                 "enabled": self.config.tinyfish_enabled,
                 "reachable": tinyfish_probe.ok,
+                "status": tinyfish_probe.status(),
                 "detail": tinyfish_probe.detail,
             },
             "firecrawl": {
                 "api_url": self.config.firecrawl_api_url,
                 "enabled": self.config.firecrawl_enabled,
                 "reachable": firecrawl_probe.ok,
+                "status": firecrawl_probe.status(),
                 "detail": firecrawl_probe.detail,
             },
             "source_chain": source_chain,
@@ -1332,7 +1977,86 @@ impl SearchService {
             "cache_size": self.config.cache_size,
             "timeout_seconds": self.config.timeout.as_secs(),
             "github_token": self.config.github_token_status(),
-            "redacted": self.config.redacted_diagnostics()
+            "redacted": self.config.redacted_diagnostics(),
+            "note": "doctor performs live provider requests and may consume quota; provider_status checks configuration only."
+        }))
+    }
+
+    /// Configuration-only status: which providers are configured, the order
+    /// each tool will try them in, and the active engine. Makes no provider
+    /// request, so it costs no quota, and never returns a secret.
+    pub fn provider_status(&self) -> serde_json::Value {
+        use crate::config::Transport;
+        let active = self.active_sources();
+        let active_names: Vec<&'static str> = active.iter().map(|e| e.spec.name).collect();
+        let has = |name: &str| active_names.contains(&name);
+        let rest: Vec<&'static str> = active_names
+            .iter()
+            .copied()
+            .filter(|name| !matches!(*name, "brave" | "tavily"))
+            .collect();
+        let ordered = |first: &'static str, second: &'static str| -> Vec<&'static str> {
+            [first, second]
+                .into_iter()
+                .filter(|name| has(name))
+                .chain(rest.iter().copied())
+                .collect()
+        };
+        let parallel: Vec<&'static str> = ["brave", "tavily"]
+            .into_iter()
+            .filter(|name| has(name))
+            .collect();
+        let web_search = match self.config.search_engine {
+            SearchEngine::Brave => serde_json::json!({
+                "quick": ordered("brave", "tavily"),
+                "deep": ordered("tavily", "brave"),
+                "verify": { "parallel": parallel, "then": rest },
+            }),
+            SearchEngine::Grok => serde_json::json!({
+                "answer": "grok",
+                "enrichment_and_fallback": active_names,
+            }),
+        };
+        let web_map = if instantiate_source(&TAVILY_SPEC, &self.config, &self.http_client).is_some()
+        {
+            "tavily"
+        } else {
+            "unavailable (set TAVILY_API_KEY)"
+        };
+        let provider = |spec: &ProviderSpec| {
+            serde_json::json!({
+                "configured": provider_key_set(spec, &self.config),
+                "enabled": provider_enabled(spec, &self.config),
+                "active": has(spec.name),
+            })
+        };
+        serde_json::json!({
+            "checked_at": crate::clock::now_rfc3339(),
+            "engine": self.config.search_engine.as_str(),
+            "providers": {
+                "brave": provider(&BRAVE_SPEC),
+                "tavily": provider(&TAVILY_SPEC),
+                "exa": provider(&EXA_SPEC),
+                "tinyfish": provider(&TINYFISH_SPEC),
+                "firecrawl": provider(&FIRECRAWL_SPEC),
+                "grok": {
+                    "configured": self.ai.is_some(),
+                    "transport": match self.config.transport {
+                        Transport::Responses => "grok_responses",
+                        Transport::ChatCompletions => "openai_compatible",
+                    },
+                    "required": self.config.search_engine == SearchEngine::Grok,
+                    "detail": self.ai_unavailable,
+                },
+            },
+            "web_search_order": web_search,
+            "web_fetch_order": active
+                .iter()
+                .filter(|entry| entry.spec.supports_fetch)
+                .map(|entry| entry.spec.name)
+                .collect::<Vec<_>>(),
+            "web_map": web_map,
+            "note": "provider_status makes no provider request; use doctor for a live check (may consume quota)."
         })
     }
 
@@ -1372,7 +2096,15 @@ impl SearchService {
             }],
             tools,
         };
-        match self.ai.search(&request).await {
+        let Some(ai) = self.ai.as_ref() else {
+            return Probe::skipped(format!(
+                "Grok not configured: {}",
+                self.ai_unavailable
+                    .as_deref()
+                    .unwrap_or("no Grok configuration")
+            ));
+        };
+        match ai.search(&request).await {
             Ok(_) => Probe::ok("grok responded"),
             Err(err) => Probe::failed(err.to_string()),
         }
@@ -1713,6 +2445,7 @@ mod chain_tests {
     #[test]
     fn default_chain_orders_all_configured_providers_canonically() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("TAVILY_API_KEY", "t"),
             ("EXA_API_KEY", "e"),
             ("TINYFISH_API_KEY", "f"),
@@ -1735,7 +2468,8 @@ mod chain_tests {
     // so "I never set up Exa" cannot read as a broken credential.
     #[test]
     fn default_chain_slots_missing_core_but_omits_missing_optional() {
-        let config = Config::from_env_map([("TINYFISH_API_KEY", "f")]);
+        let config =
+            Config::from_env_map([("LLM_SEARCH_PROVIDER", "grok"), ("TINYFISH_API_KEY", "f")]);
         let slots = build_source_slots(&config, &http()).expect("slots");
         assert_eq!(
             slot_names(&slots),
@@ -1746,6 +2480,7 @@ mod chain_tests {
     #[test]
     fn explicit_order_overrides_and_slots_every_named_provider() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("TINYFISH_API_KEY", "f"),
             ("GROK_SEARCH_SOURCE_PROVIDERS", "tinyfish, Exa"),
         ]);
@@ -1755,7 +2490,10 @@ mod chain_tests {
 
     #[test]
     fn unknown_provider_name_fails_construction() {
-        let config = Config::from_env_map([("GROK_SEARCH_SOURCE_PROVIDERS", "tavily,serpapi")]);
+        let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_SOURCE_PROVIDERS", "tavily,serpapi"),
+        ]);
         let err = match build_source_slots(&config, &http()) {
             Err(err) => err,
             Ok(_) => panic!("must reject unknown provider name"),
@@ -1821,11 +2559,15 @@ mod chain_tests {
     }
 
     fn chain_service(slots: Vec<SourceSlot>, ai: Arc<dyn AiProvider>) -> SearchService {
-        let config = Config::from_env_map([("GROK_SEARCH_API_KEY", "fake")]);
+        let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_API_KEY", "fake"),
+        ]);
         SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai,
+            ai: Some(ai),
+            ai_unavailable: None,
             source_slots: Arc::new(slots),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
@@ -1933,13 +2675,15 @@ mod chain_tests {
     #[tokio::test]
     async fn chain_is_bounded_by_the_global_deadline() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "fake"),
             ("GROK_SEARCH_TIMEOUT_SECONDS", "1"),
         ]);
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(ErrAiProvider),
+            ai: Some(Arc::new(ErrAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(vec![
                 SourceSlot::Active(SourceEntry {
                     spec: &TAVILY_SPEC,
@@ -1996,13 +2740,15 @@ mod chain_tests {
     #[tokio::test]
     async fn web_fetch_chain_is_bounded_by_one_deadline() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "fake"),
             ("GROK_SEARCH_TIMEOUT_SECONDS", "1"),
         ]);
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(vec![
                 SourceSlot::Active(SourceEntry {
                     spec: &TAVILY_SPEC,
@@ -2038,6 +2784,7 @@ mod chain_tests {
     #[tokio::test]
     async fn web_map_survives_a_chain_that_excludes_tavily() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "fake"),
             ("TAVILY_API_KEY", "fake-tavily"),
             ("GROK_SEARCH_SOURCE_PROVIDERS", "tinyfish"),
@@ -2045,7 +2792,8 @@ mod chain_tests {
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(vec![SourceSlot::Active(SourceEntry {
                 spec: &TINYFISH_SPEC,
                 provider: Arc::new(NamedSourceProvider("tinyfish")),
@@ -2109,6 +2857,233 @@ mod chain_tests {
 /// only when the operator hasn't set one. Resolved once at service
 /// construction so every outgoing `SearchRequest` carries the right default
 /// — preventing the chat path from silently shipping a Grok-only ID.
+/// Router-mode results when the caller does not ask for a count.
+const ROUTER_DEFAULT_RESULTS: usize = 5;
+/// Router-mode result ceiling, as in the DeepSeek plugin.
+const ROUTER_MAX_RESULTS: usize = 10;
+/// Per-result cap on Tavily inline page text in deep / verify.
+const ROUTER_RAW_CONTENT_CHARS: usize = 6_000;
+/// Per-provider cap on a recorded fallback error.
+const FALLBACK_ERROR_CHARS: usize = 500;
+
+/// Router mode for `web_search` (`LLM_SEARCH_PROVIDER=brave`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouterMode {
+    Quick,
+    Deep,
+    Verify,
+}
+
+impl RouterMode {
+    fn parse(value: Option<&str>) -> Result<Self> {
+        match value.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("quick") => Ok(RouterMode::Quick),
+            Some("deep") => Ok(RouterMode::Deep),
+            Some("verify") => Ok(RouterMode::Verify),
+            Some(other) => Err(GrokSearchError::InvalidParams(format!(
+                "mode must be \"quick\", \"deep\", or \"verify\", got \"{other}\""
+            ))),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            RouterMode::Quick => "quick",
+            RouterMode::Deep => "deep",
+            RouterMode::Verify => "verify",
+        }
+    }
+}
+
+/// Search options for one provider in one router mode: Tavily goes advanced
+/// with an answer and inline page text in deep / verify; every other call is
+/// a plain search.
+fn router_options(provider: &str, mode: RouterMode) -> SearchOptions {
+    if provider == "tavily" && mode != RouterMode::Quick {
+        SearchOptions {
+            depth: crate::model::search::SearchDepth::Advanced,
+            include_answer: true,
+            include_raw_content: true,
+            raw_content_max_chars: ROUTER_RAW_CONTENT_CHARS,
+        }
+    } else {
+        SearchOptions::default()
+    }
+}
+
+/// One router attempt against one provider. `Err` carries the reason it did
+/// not serve: skipped for filters, timed out, upstream error, or no results.
+async fn router_attempt(
+    entry: &SourceEntry,
+    query: &str,
+    max_results: usize,
+    filters: &SearchFilters,
+    mode: RouterMode,
+    deadline: tokio::time::Instant,
+) -> std::result::Result<DetailedSearch, String> {
+    let name = entry.spec.name;
+    if !filters.is_empty() && !entry.spec.supports_filters {
+        return Err(format!(
+            "skipped (request carries domain/recency filters, which {name} cannot honor)"
+        ));
+    }
+    let options = router_options(name, mode);
+    let attempt = tokio::time::timeout_at(
+        deadline,
+        entry
+            .provider
+            .search_detailed(query, max_results, filters, &options),
+    )
+    .await;
+    match attempt {
+        Err(_elapsed) => Err("timed out (request deadline reached)".to_string()),
+        Ok(Err(err)) => Err(crate::model::source::truncate_with_marker(
+            &err.to_string(),
+            FALLBACK_ERROR_CHARS,
+        )),
+        Ok(Ok(mut found)) => {
+            found.sources.retain(|source| !source.url.trim().is_empty());
+            found.sources.truncate(max_results);
+            if found.sources.is_empty() && found.answer.is_none() {
+                Err("no results".to_string())
+            } else {
+                Ok(found)
+            }
+        }
+    }
+}
+
+/// [`router_attempt`] for an optional provider, tagged with its name; `None`
+/// when the provider is not configured.
+async fn router_attempt_opt(
+    entry: Option<&SourceEntry>,
+    query: &str,
+    max_results: usize,
+    filters: &SearchFilters,
+    mode: RouterMode,
+    deadline: tokio::time::Instant,
+) -> Option<(&'static str, std::result::Result<DetailedSearch, String>)> {
+    let entry = entry?;
+    Some((
+        entry.spec.name,
+        router_attempt(entry, query, max_results, filters, mode, deadline).await,
+    ))
+}
+
+/// Try `order` in sequence; the first provider with a usable result serves.
+/// Every provider tried before it lands in `fallbacks`.
+async fn router_first_hit(
+    order: &[SourceEntry],
+    query: &str,
+    max_results: usize,
+    filters: &SearchFilters,
+    mode: RouterMode,
+    deadline: tokio::time::Instant,
+    fallbacks: &mut Vec<SearchFallback>,
+) -> Option<(String, DetailedSearch)> {
+    for entry in order {
+        match router_attempt(entry, query, max_results, filters, mode, deadline).await {
+            Ok(found) => return Some((entry.spec.name.to_string(), found)),
+            Err(error) => fallbacks.push(SearchFallback {
+                provider: entry.spec.name.to_string(),
+                error,
+            }),
+        }
+    }
+    None
+}
+
+/// The `content` of a router-mode result: the provider answer when there is
+/// one, otherwise a pointer to the structured sources.
+fn render_router_content(
+    provider: &str,
+    mode: RouterMode,
+    count: usize,
+    answer: Option<&str>,
+) -> String {
+    match answer {
+        Some(answer) => format!(
+            "{answer}\n\n(Answer generated by Tavily from {count} result(s), mode={}; verify it against `sources` and cite them by `source_log` id.)",
+            mode.as_str()
+        ),
+        None => format!(
+            "{count} result(s) from {provider} (mode={}). This mode returns no AI-written answer: read `sources` (title, url, description, and inline content when present) and cite them by `source_log` id.",
+            mode.as_str()
+        ),
+    }
+}
+
+/// `Search provider fallback used: …` disclosure, or `None` when the first
+/// provider served.
+fn fallback_notice(fallbacks: &[SearchFallback]) -> Option<String> {
+    if fallbacks.is_empty() {
+        return None;
+    }
+    let detail = fallbacks
+        .iter()
+        .map(|entry| format!("{}: {}", entry.provider, entry.error))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Some(format!(
+        "Search provider fallback used: {detail}. Disclose this if the answer relies on fallback results."
+    ))
+}
+
+/// Stable `fallback_reason` identifier for the first provider that did not
+/// serve: `{provider}_no_results`, `{provider}_skipped`, `{provider}_timeout`,
+/// or `{provider}_error`.
+fn fallback_reason_id(entry: &SearchFallback) -> String {
+    let kind = if entry.error == "no results" {
+        "no_results"
+    } else if entry.error.starts_with("skipped") {
+        "skipped"
+    } else if entry.error.starts_with("timed out") {
+        "timeout"
+    } else {
+        "error"
+    };
+    format!("{}_{kind}", entry.provider)
+}
+
+/// Host of an HTTP(S) URL, if it parses.
+fn domain_of(url: &str) -> Option<String> {
+    url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_string))
+}
+
+/// `source_log` for returned sources: `src_001`… in returned order, ranked,
+/// stamped with one access time.
+fn build_source_log(sources: &[Source], query: Option<&str>) -> Vec<SourceLogEntry> {
+    let accessed_at = crate::clock::now_rfc3339();
+    sources
+        .iter()
+        .enumerate()
+        .map(|(idx, source)| SourceLogEntry {
+            source_id: format!("src_{:03}", idx + 1),
+            url: source.url.clone(),
+            provider: Some(source.provider.to_string()),
+            domain: domain_of(&source.url),
+            title: source.title.clone(),
+            rank: Some(idx + 1),
+            query: query.map(str::to_string),
+            accessed_at: Some(accessed_at.clone()),
+            extracted_at: None,
+            content_hash: None,
+            status: "success".to_string(),
+        })
+        .collect()
+}
+
+/// SHA-256 of `text`, lowercase hex.
+fn sha256_hex(text: &str) -> String {
+    ring::digest::digest(&ring::digest::SHA256, text.as_bytes())
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn resolve_default_model(config: &Config) -> String {
     use crate::config::Transport;
     match config.transport {
@@ -2173,6 +3148,11 @@ fn apply_fetch_limit(
             truncated: false,
             source_type,
             fallback_reason,
+            provider: None,
+            domain: None,
+            content_hash: String::new(),
+            extracted_at: String::new(),
+            source_log: Vec::new(),
         };
     };
 
@@ -2197,6 +3177,11 @@ fn apply_fetch_limit(
                 truncated: true,
                 source_type,
                 fallback_reason,
+                provider: None,
+                domain: None,
+                content_hash: String::new(),
+                extracted_at: String::new(),
+                source_log: Vec::new(),
             }
         }
         None => WebFetchOutput {
@@ -2206,6 +3191,11 @@ fn apply_fetch_limit(
             truncated: false,
             source_type,
             fallback_reason,
+            provider: None,
+            domain: None,
+            content_hash: String::new(),
+            extracted_at: String::new(),
+            source_log: Vec::new(),
         },
     }
 }
@@ -2217,10 +3207,22 @@ fn apply_fetch_limit(
 /// provider is configured at all; otherwise the last attempt's real error
 /// surfaces, so users are not sent to debug config that is actually set.
 async fn generic_source_fetch(chain: &[SourceEntry], url: &str) -> Result<FetchedPage> {
+    generic_source_fetch_with(chain, url, &FetchOptions::default())
+        .await
+        .map(|(page, _served)| page)
+}
+
+/// [`generic_source_fetch`] with extraction options, also naming the
+/// provider that served the page. Search-only providers (Brave) are skipped.
+async fn generic_source_fetch_with(
+    chain: &[SourceEntry],
+    url: &str,
+    options: &FetchOptions,
+) -> Result<(FetchedPage, &'static str)> {
     let mut last_error: Option<GrokSearchError> = None;
-    for entry in chain {
-        match entry.provider.fetch(url).await {
-            Ok(page) if !page.content.trim().is_empty() => return Ok(page),
+    for entry in chain.iter().filter(|entry| entry.spec.supports_fetch) {
+        match entry.provider.fetch_with(url, options).await {
+            Ok(page) if !page.content.trim().is_empty() => return Ok((page, entry.spec.name)),
             Ok(_) => {
                 last_error = Some(GrokSearchError::Provider(format!(
                     "{} returned empty content for {url}",
@@ -2231,6 +3233,39 @@ async fn generic_source_fetch(chain: &[SourceEntry], url: &str) -> Result<Fetche
         }
     }
     Err(last_error.unwrap_or(GrokSearchError::MissingConfig(SOURCE_PROVIDER_KEYS)))
+}
+
+/// Fill `web_fetch` provenance: provider, domain, SHA-256 of the returned
+/// content, extraction time, and a one-entry `source_log`.
+fn finish_fetch_output(
+    mut out: WebFetchOutput,
+    provider: Option<String>,
+    extracted_at: String,
+) -> WebFetchOutput {
+    let content_hash = sha256_hex(&out.content);
+    let domain = domain_of(&out.url);
+    out.source_log = vec![SourceLogEntry {
+        source_id: "src_001".to_string(),
+        url: out.url.clone(),
+        provider: provider.clone(),
+        domain: domain.clone(),
+        extracted_at: Some(extracted_at.clone()),
+        content_hash: Some(content_hash.clone()),
+        status: "success".to_string(),
+        ..SourceLogEntry::default()
+    }];
+    out.provider = provider;
+    out.domain = domain;
+    out.content_hash = content_hash;
+    out.extracted_at = extracted_at;
+    out
+}
+
+/// The serialized name of a specialist `SourceType` (`github_issue`, …).
+fn source_type_label(kind: &crate::sources::SourceType) -> Option<String> {
+    serde_json::to_value(kind)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
 }
 
 /// The keys that make a generic fetch possible at all. Named from one place so
@@ -2540,6 +3575,10 @@ fn with_provider(
 
 struct Probe {
     ok: bool,
+    /// Not probed because the provider is not configured.
+    skipped: bool,
+    /// Not probed because it was outside the requested `doctor` scope.
+    not_checked: bool,
     detail: String,
 }
 
@@ -2547,20 +3586,78 @@ impl Probe {
     fn ok(detail: impl Into<String>) -> Self {
         Self {
             ok: true,
+            skipped: false,
+            not_checked: false,
             detail: detail.into(),
         }
     }
     fn failed(detail: impl Into<String>) -> Self {
         Self {
             ok: false,
+            skipped: false,
+            not_checked: false,
             detail: detail.into(),
         }
     }
     fn skipped(detail: impl Into<String>) -> Self {
         Self {
             ok: false,
+            skipped: true,
+            not_checked: false,
             detail: detail.into(),
         }
+    }
+    fn not_checked() -> Self {
+        Self {
+            ok: false,
+            skipped: false,
+            not_checked: true,
+            detail: "not checked (outside the requested provider)".to_string(),
+        }
+    }
+
+    /// Health class, as in the DeepSeek plugin's `health_check`: `ok`,
+    /// `not_configured`, `not_checked`, `auth_error`, `rate_limited`,
+    /// `timeout`, or `error`.
+    fn status(&self) -> &'static str {
+        if self.ok {
+            return "ok";
+        }
+        if self.not_checked {
+            return "not_checked";
+        }
+        if self.skipped {
+            return "not_configured";
+        }
+        classify_probe_error(&self.detail)
+    }
+}
+
+/// Classify a provider error message for `doctor`.
+fn classify_probe_error(detail: &str) -> &'static str {
+    let lower = detail.to_ascii_lowercase();
+    let has = |needle: &str| lower.contains(needle);
+    if has("http 401")
+        || has("http 403")
+        || has("unauthori")
+        || has("forbidden")
+        || has("invalid api key")
+        || has("invalid key")
+    {
+        "auth_error"
+    } else if has("http 429")
+        || has("http 432")
+        || has("http 433")
+        || has("rate limit")
+        || has("rate-limit")
+        || has("quota")
+        || has("too many requests")
+    {
+        "rate_limited"
+    } else if has("timed out") || has("timeout") {
+        "timeout"
+    } else {
+        "error"
     }
 }
 
@@ -2624,6 +3721,7 @@ mod transport_dispatch_tests {
     #[test]
     fn service_constructs_for_chat_completions_transport() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
             ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
             ("OPENAI_COMPATIBLE_MODEL", "grok-4.3-fast"),
@@ -2639,7 +3737,10 @@ mod transport_dispatch_tests {
 
     #[test]
     fn service_rejects_chat_completions_without_url() {
-        let config = Config::from_env_map([("OPENAI_COMPATIBLE_API_KEY", "sk-fake")]);
+        let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
+        ]);
         // url missing -> falls back to Responses transport, which then needs
         // GROK_SEARCH_API_KEY which is also missing -> MissingConfig.
         assert!(SearchService::new(config).is_err());
@@ -2651,6 +3752,7 @@ mod transport_dispatch_tests {
         // to stamp `grok_model` into every SearchRequest, masking
         // OPENAI_COMPATIBLE_MODEL on the chat-completions transport.
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
             ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
             ("OPENAI_COMPATIBLE_MODEL", "gpt-4o-mini"),
@@ -2663,6 +3765,7 @@ mod transport_dispatch_tests {
     #[test]
     fn default_model_falls_back_to_grok_model_when_compat_model_missing() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
             ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
             ("GROK_SEARCH_MODEL", "grok-4-1-fast-reasoning"),
@@ -2674,6 +3777,7 @@ mod transport_dispatch_tests {
     #[test]
     fn default_model_uses_grok_model_on_responses_transport() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "xai-fake"),
             ("GROK_SEARCH_MODEL", "grok-4-1-fast-reasoning"),
             ("OPENAI_COMPATIBLE_MODEL", "gpt-4o-mini"),
@@ -2688,6 +3792,7 @@ mod transport_dispatch_tests {
         // grok_api_url, masking what the service actually dispatches to on the
         // chat-completions transport. Now it must reflect compat config.
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("OPENAI_COMPATIBLE_API_URL", "https://compat.example/v1"),
             ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
             ("OPENAI_COMPATIBLE_MODEL", "gpt-4o-mini"),
@@ -2703,7 +3808,8 @@ mod transport_dispatch_tests {
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -2721,6 +3827,7 @@ mod transport_dispatch_tests {
     #[tokio::test]
     async fn doctor_still_reports_grok_responses_on_responses_transport() {
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "xai-fake"),
             ("GROK_SEARCH_MODEL", "grok-4-1-fast-reasoning"),
         ]);
@@ -2729,7 +3836,8 @@ mod transport_dispatch_tests {
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -2745,13 +3853,15 @@ mod transport_dispatch_tests {
     async fn doctor_reports_github_token_status() {
         // With GITHUB_TOKEN set -> "set", and the raw value never leaks.
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "xai-fake"),
             ("GITHUB_TOKEN", "ghp_test"),
         ]);
         let svc = SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -2766,11 +3876,15 @@ mod transport_dispatch_tests {
         );
 
         // Without GITHUB_TOKEN -> "unset".
-        let config_unset = Config::from_env_map([("GROK_SEARCH_API_KEY", "xai-fake")]);
+        let config_unset = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_API_KEY", "xai-fake"),
+        ]);
         let svc_unset = SearchService {
             default_model: resolve_default_model(&config_unset),
             config: config_unset,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -2785,7 +3899,8 @@ mod transport_dispatch_tests {
         SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(Vec::new()),
             cache: Arc::new(Mutex::new(SourceCache::new(16))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -2798,7 +3913,10 @@ mod transport_dispatch_tests {
         // The whole point: a typo used to void the entire file with nothing to
         // show for it but a stderr line the client swallowed, leaving the
         // operator to conclude their key "wasn't configured" (issue #35).
-        let mut config = Config::from_env_map([("GROK_SEARCH_API_KEY", "xai-fake")]);
+        let mut config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_API_KEY", "xai-fake"),
+        ]);
         config.config_file_path = Some(std::path::PathBuf::from("/tmp/does-not-matter.toml"));
         config.config_file_state =
             crate::config::ConfigFileState::Rejected("unknown field `tavly_api_key`".to_string());
@@ -2822,10 +3940,12 @@ mod transport_dispatch_tests {
     #[tokio::test]
     async fn doctor_distinguishes_an_absent_config_file_from_a_rejected_one() {
         // Running on environment variables alone is normal, not a failure.
-        let report =
-            service_for_config(Config::from_env_map([("GROK_SEARCH_API_KEY", "xai-fake")]))
-                .doctor()
-                .await;
+        let report = service_for_config(Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_API_KEY", "xai-fake"),
+        ]))
+        .doctor()
+        .await;
 
         assert_eq!(report["config_file"]["state"], "absent");
         assert!(
@@ -2839,6 +3959,7 @@ mod transport_dispatch_tests {
         // A report that echoes config the providers do not use would send the
         // operator to debug a URL nothing ever contacts.
         let config = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "xai-fake"),
             ("GROK_SEARCH_URL", "https://gateway.example"),
             ("EXA_API_URL", "https://exa.example"),
@@ -3038,7 +4159,8 @@ mod enrich_tests {
         SearchService {
             default_model: resolve_default_model(&config),
             config,
-            ai: Arc::new(FakeAiProvider),
+            ai: Some(Arc::new(FakeAiProvider)),
+            ai_unavailable: None,
             source_slots: Arc::new(source_slots),
             cache: Arc::new(Mutex::new(SourceCache::new(64))),
             http_client: crate::providers::http::build_client(std::time::Duration::from_secs(30)),
@@ -3052,6 +4174,7 @@ mod enrich_tests {
 
     fn enrich_config() -> Config {
         Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "fake-grok"),
             ("TAVILY_API_KEY", "fake-tavily"),
         ])
@@ -3708,7 +4831,10 @@ mod request_scope_tests {
     #[test]
     fn with_config_rejects_oauth() {
         let svc = template();
-        let cfg = Config::from_env_map([("GROK_SEARCH_AUTH_MODE", "oauth")]);
+        let cfg = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
+            ("GROK_SEARCH_AUTH_MODE", "oauth"),
+        ]);
         assert!(
             svc.with_config(cfg).is_err(),
             "OAuth must be rejected on the per-request (HTTP) path"
@@ -3720,7 +4846,7 @@ mod request_scope_tests {
         let svc = template();
         // No grok key and no OpenAI-compatible gateway -> Responses transport ->
         // construction fails rather than silently reusing the template's key.
-        let cfg = Config::from_env_map(Vec::<(String, String)>::new());
+        let cfg = Config::from_env_map([("LLM_SEARCH_PROVIDER", "grok")]);
         assert!(
             svc.with_config(cfg).is_err(),
             "missing required key must fail closed, never fall back to the server key"
@@ -3731,6 +4857,7 @@ mod request_scope_tests {
     fn with_config_accepts_per_request_key() {
         let svc = template();
         let cfg = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "xai-caller"),
             ("TAVILY_API_KEY", "tvly-caller"),
         ]);
@@ -3765,7 +4892,10 @@ mod request_scope_tests {
 
         // A different caller key must NOT read that session.
         let other = svc
-            .with_config(Config::from_env_map([("GROK_SEARCH_API_KEY", "xai-other")]))
+            .with_config(Config::from_env_map([
+                ("LLM_SEARCH_PROVIDER", "grok"),
+                ("GROK_SEARCH_API_KEY", "xai-other"),
+            ]))
             .expect("other-tenant scoped service");
         assert!(
             other.get_sources(session, 0, None).await.is_err(),
@@ -3779,10 +4909,12 @@ mod request_scope_tests {
         // namespace: with arbitrary public gateways, independent gateways can
         // issue/accept identical key strings for different callers.
         let on_xai = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "same-key"),
             ("GROK_SEARCH_URL", "https://api.x.ai"),
         ]);
         let on_other = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "same-key"),
             ("GROK_SEARCH_URL", "https://gateway.example"),
         ]);
@@ -3793,9 +4925,544 @@ mod request_scope_tests {
         );
         // Same key + same gateway stays stable (continuation still works).
         let again = Config::from_env_map([
+            ("LLM_SEARCH_PROVIDER", "grok"),
             ("GROK_SEARCH_API_KEY", "same-key"),
             ("GROK_SEARCH_URL", "https://api.x.ai"),
         ]);
         assert_eq!(tenant_tag(&on_xai), tenant_tag(&again));
+    }
+}
+
+/// Router mode (`LLM_SEARCH_PROVIDER=brave`), `web_fetch` provenance, and
+/// `provider_status`.
+#[cfg(test)]
+mod router_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    /// Scripted search provider: fixed results (or error), optional answer,
+    /// call counting, and a record of the options and size it was asked for.
+    struct Scripted {
+        label: &'static str,
+        urls: Vec<&'static str>,
+        error: Option<&'static str>,
+        answer: Option<&'static str>,
+        calls: AtomicUsize,
+        fetch_calls: AtomicUsize,
+        seen_options: StdMutex<Option<SearchOptions>>,
+        seen_max: AtomicUsize,
+    }
+
+    impl Scripted {
+        fn build(
+            label: &'static str,
+            urls: Vec<&'static str>,
+            error: Option<&'static str>,
+            answer: Option<&'static str>,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                label,
+                urls,
+                error,
+                answer,
+                calls: AtomicUsize::new(0),
+                fetch_calls: AtomicUsize::new(0),
+                seen_options: StdMutex::new(None),
+                seen_max: AtomicUsize::new(0),
+            })
+        }
+        fn ok(label: &'static str, urls: Vec<&'static str>) -> Arc<Self> {
+            Self::build(label, urls, None, None)
+        }
+        fn failing(label: &'static str, error: &'static str) -> Arc<Self> {
+            Self::build(label, vec![], Some(error), None)
+        }
+        fn with_answer(
+            label: &'static str,
+            urls: Vec<&'static str>,
+            answer: &'static str,
+        ) -> Arc<Self> {
+            Self::build(label, urls, None, Some(answer))
+        }
+    }
+
+    #[async_trait]
+    impl SourceProvider for Scripted {
+        async fn search_sources(
+            &self,
+            query: &str,
+            max_results: usize,
+            filters: &SearchFilters,
+        ) -> Result<Vec<Source>> {
+            Ok(self
+                .search_detailed(query, max_results, filters, &SearchOptions::default())
+                .await?
+                .sources)
+        }
+
+        async fn search_detailed(
+            &self,
+            _query: &str,
+            max_results: usize,
+            _filters: &SearchFilters,
+            options: &SearchOptions,
+        ) -> Result<DetailedSearch> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.seen_max.store(max_results, Ordering::SeqCst);
+            *self.seen_options.lock().unwrap() = Some(options.clone());
+            if let Some(error) = self.error {
+                return Err(GrokSearchError::Provider(error.to_string()));
+            }
+            Ok(DetailedSearch {
+                answer: self.answer.map(str::to_string),
+                sources: self
+                    .urls
+                    .iter()
+                    .map(|url| {
+                        Source::new(*url, self.label).with_title(format!("{} result", self.label))
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn fetch(&self, url: &str) -> Result<FetchedPage> {
+            self.fetch_calls.fetch_add(1, Ordering::SeqCst);
+            if url.contains("broken") {
+                return Err(GrokSearchError::Provider(format!(
+                    "{} cannot read {url}",
+                    self.label
+                )));
+            }
+            Ok(FetchedPage::text(format!("{} page for {url}", self.label)))
+        }
+
+        async fn map(&self, _url: &str, _max_results: usize) -> Result<Vec<Source>> {
+            Ok(Vec::new())
+        }
+    }
+
+    fn router_service(
+        slots: Vec<(&'static ProviderSpec, Arc<dyn SourceProvider>)>,
+    ) -> SearchService {
+        let config = Config::from_env_map([("LLM_SEARCH_PROVIDER", "brave")]);
+        SearchService {
+            default_model: resolve_default_model(&config),
+            config,
+            ai: None,
+            ai_unavailable: Some("no Grok configuration".to_string()),
+            source_slots: Arc::new(
+                slots
+                    .into_iter()
+                    .map(|(spec, provider)| SourceSlot::Active(SourceEntry { spec, provider }))
+                    .collect(),
+            ),
+            cache: Arc::new(Mutex::new(SourceCache::new(16))),
+            http_client: crate::providers::http::build_client(std::time::Duration::from_secs(5)),
+            source_router: Arc::new(crate::sources::SourceRouter::default()),
+        }
+    }
+
+    fn input(mode: Option<&str>) -> WebSearchInput {
+        WebSearchInput {
+            query: "router test".to_string(),
+            mode: mode.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_serves_from_brave_without_touching_tavily() {
+        let brave = Scripted::ok("brave", vec!["https://a.example/", "https://b.example/"]);
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![
+            (&BRAVE_SPEC, brave.clone()),
+            (&TAVILY_SPEC, tavily.clone()),
+        ]);
+
+        let out = svc.web_search(input(None)).await.expect("search");
+
+        assert_eq!(out.engine, "brave");
+        assert_eq!(out.mode.as_deref(), Some("quick"));
+        assert_eq!(out.search_provider, "brave");
+        assert!(!out.fallback_used);
+        assert!(out.notice.is_none());
+        assert!(out.fallbacks.is_empty());
+        assert_eq!(out.sources.len(), 2);
+        assert_eq!(tavily.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(out.source_log.len(), 2);
+        assert_eq!(out.source_log[0].source_id, "src_001");
+        assert_eq!(out.source_log[1].rank, Some(2));
+        assert_eq!(out.source_log[0].domain.as_deref(), Some("a.example"));
+        assert_eq!(out.source_log[0].query.as_deref(), Some("router test"));
+        // No content was requested: brave results stay snippets.
+        assert!(out.sources.iter().all(|s| s.content.is_none()));
+    }
+
+    #[tokio::test]
+    async fn quick_falls_back_to_tavily_and_discloses_it() {
+        let brave = Scripted::failing("brave", "Brave returned HTTP 401 Unauthorized");
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave), (&TAVILY_SPEC, tavily)]);
+
+        let out = svc.web_search(input(Some("quick"))).await.expect("search");
+
+        assert_eq!(out.search_provider, "tavily");
+        assert!(out.fallback_used);
+        assert_eq!(out.fallback_reason.as_deref(), Some("brave_error"));
+        assert_eq!(out.fallbacks.len(), 1);
+        assert_eq!(out.fallbacks[0].provider, "brave");
+        assert!(out.fallbacks[0].error.contains("401"));
+        let notice = out.notice.expect("notice");
+        assert!(notice.contains("brave"), "{notice}");
+        assert!(notice.contains("Disclose"), "{notice}");
+    }
+
+    #[tokio::test]
+    async fn deep_prefers_tavily_with_advanced_options_and_answer() {
+        let brave = Scripted::ok("brave", vec!["https://a.example/"]);
+        let tavily =
+            Scripted::with_answer("tavily", vec!["https://t.example/"], "Tavily says yes.");
+        let svc = router_service(vec![
+            (&BRAVE_SPEC, brave.clone()),
+            (&TAVILY_SPEC, tavily.clone()),
+        ]);
+
+        let out = svc.web_search(input(Some("deep"))).await.expect("search");
+
+        assert_eq!(out.search_provider, "tavily");
+        assert_eq!(out.mode.as_deref(), Some("deep"));
+        assert_eq!(out.answer.as_deref(), Some("Tavily says yes."));
+        assert!(out.content.starts_with("Tavily says yes."));
+        assert_eq!(brave.calls.load(Ordering::SeqCst), 0);
+        let options = tavily
+            .seen_options
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("options");
+        assert_eq!(options.depth, crate::model::search::SearchDepth::Advanced);
+        assert!(options.include_answer);
+        assert!(options.include_raw_content);
+        assert_eq!(options.raw_content_max_chars, ROUTER_RAW_CONTENT_CHARS);
+    }
+
+    #[tokio::test]
+    async fn quick_keeps_tavily_basic() {
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![(&TAVILY_SPEC, tavily.clone())]);
+
+        svc.web_search(input(None)).await.expect("search");
+
+        let options = tavily
+            .seen_options
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("options");
+        assert_eq!(options, SearchOptions::default());
+    }
+
+    #[tokio::test]
+    async fn verify_runs_both_and_merges_by_url() {
+        let brave = Scripted::ok(
+            "brave",
+            vec!["https://a.example/", "https://shared.example/"],
+        );
+        let tavily = Scripted::ok(
+            "tavily",
+            vec!["https://shared.example/", "https://t.example/"],
+        );
+        let svc = router_service(vec![
+            (&BRAVE_SPEC, brave.clone()),
+            (&TAVILY_SPEC, tavily.clone()),
+        ]);
+
+        let out = svc.web_search(input(Some("verify"))).await.expect("search");
+
+        assert_eq!(out.search_provider, "mixed");
+        assert_eq!(brave.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(tavily.calls.load(Ordering::SeqCst), 1);
+        let urls: Vec<&str> = out.sources.iter().map(|s| s.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://a.example/",
+                "https://shared.example/",
+                "https://t.example/"
+            ]
+        );
+        // The shared URL keeps the provider that returned it first.
+        assert_eq!(out.sources[1].provider, "brave");
+        assert!(out.notice.is_none());
+    }
+
+    #[tokio::test]
+    async fn verify_reports_the_side_that_failed() {
+        let brave = Scripted::failing("brave", "Brave returned HTTP 429 Too Many Requests");
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave), (&TAVILY_SPEC, tavily)]);
+
+        let out = svc.web_search(input(Some("verify"))).await.expect("search");
+
+        assert_eq!(out.search_provider, "tavily");
+        assert_eq!(out.fallbacks.len(), 1);
+        assert_eq!(out.fallbacks[0].provider, "brave");
+        assert!(out.notice.is_some());
+    }
+
+    #[tokio::test]
+    async fn rest_of_chain_serves_when_brave_and_tavily_fail() {
+        let brave = Scripted::failing("brave", "down");
+        let tavily = Scripted::failing("tavily", "down");
+        let exa = Scripted::ok("exa", vec!["https://e.example/"]);
+        let svc = router_service(vec![
+            (&TAVILY_SPEC, tavily),
+            (&EXA_SPEC, exa),
+            (&BRAVE_SPEC, brave),
+        ]);
+
+        let out = svc.web_search(input(Some("verify"))).await.expect("search");
+
+        assert_eq!(out.search_provider, "exa");
+        let tried: Vec<&str> = out.fallbacks.iter().map(|f| f.provider.as_str()).collect();
+        assert_eq!(tried, vec!["brave", "tavily"]);
+    }
+
+    #[tokio::test]
+    async fn empty_results_count_as_a_fallback() {
+        let brave = Scripted::ok("brave", vec![]);
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave), (&TAVILY_SPEC, tavily)]);
+
+        let out = svc.web_search(input(None)).await.expect("search");
+
+        assert_eq!(out.fallback_reason.as_deref(), Some("brave_no_results"));
+        assert_eq!(out.fallbacks[0].error, "no results");
+    }
+
+    #[tokio::test]
+    async fn all_failures_name_every_provider() {
+        let brave = Scripted::failing("brave", "brave broke");
+        let tavily = Scripted::failing("tavily", "tavily broke");
+        let svc = router_service(vec![(&BRAVE_SPEC, brave), (&TAVILY_SPEC, tavily)]);
+
+        let err = svc.web_search(input(None)).await.expect_err("must fail");
+        let message = err.to_string();
+        assert!(message.contains("brave: "), "{message}");
+        assert!(message.contains("tavily: "), "{message}");
+    }
+
+    #[tokio::test]
+    async fn no_search_provider_is_a_config_error() {
+        let svc = router_service(vec![]);
+        let err = svc.web_search(input(None)).await.expect_err("must fail");
+        assert!(matches!(err, GrokSearchError::MissingConfig(_)), "{err}");
+        assert!(err.to_string().contains("BRAVE_API_KEY"));
+    }
+
+    #[tokio::test]
+    async fn max_results_is_clamped_to_ten() {
+        let brave = Scripted::ok("brave", vec!["https://a.example/"]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave.clone())]);
+
+        let mut request = input(None);
+        request.max_results = Some(50);
+        svc.web_search(request).await.expect("search");
+        assert_eq!(brave.seen_max.load(Ordering::SeqCst), ROUTER_MAX_RESULTS);
+
+        svc.web_search(input(None)).await.expect("search");
+        assert_eq!(
+            brave.seen_max.load(Ordering::SeqCst),
+            ROUTER_DEFAULT_RESULTS
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_mode_is_rejected() {
+        let brave = Scripted::ok("brave", vec!["https://a.example/"]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave)]);
+        let err = svc
+            .web_search(input(Some("fast")))
+            .await
+            .expect_err("must fail");
+        assert!(matches!(err, GrokSearchError::InvalidParams(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn filtered_requests_skip_filter_blind_providers() {
+        // Brave unconfigured: quick runs Tavily (down), then the rest of the
+        // chain, where Firecrawl cannot honor a recency filter.
+        let firecrawl = Scripted::ok("firecrawl", vec!["https://f.example/"]);
+        let svc = router_service(vec![
+            (&TAVILY_SPEC, Scripted::failing("tavily", "down")),
+            (&FIRECRAWL_SPEC, firecrawl.clone()),
+        ]);
+        let mut request = input(None);
+        request.recency_days = Some(3);
+        let err = svc
+            .web_search(request)
+            .await
+            .expect_err("nothing can serve");
+        assert!(err.to_string().contains("firecrawl: skipped"), "{err}");
+        assert_eq!(firecrawl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn grok_mode_warns_about_router_only_parameters() {
+        let svc = SearchService::fake_with_sources();
+        let mut request = input(Some("deep"));
+        request.max_results = Some(3);
+        request.include_content = Some(false);
+        let out = svc.web_search(request).await.expect("search");
+        assert_eq!(out.engine, "grok");
+        assert!(out.mode.is_none());
+        assert_eq!(out.warnings.len(), 2, "{:?}", out.warnings);
+        assert_eq!(out.source_log.len(), out.sources.len());
+    }
+
+    #[tokio::test]
+    async fn web_fetch_reports_provider_hash_and_source_log() {
+        let tavily = Scripted::ok("tavily", vec![]);
+        let svc = router_service(vec![(&TAVILY_SPEC, tavily)]);
+
+        let out = svc
+            .web_fetch("https://docs.example/page", None)
+            .await
+            .expect("fetch");
+
+        assert_eq!(out.provider.as_deref(), Some("tavily"));
+        assert_eq!(out.domain.as_deref(), Some("docs.example"));
+        assert_eq!(out.content_hash, sha256_hex(&out.content));
+        assert_eq!(out.content_hash.len(), 64);
+        assert!(out.extracted_at.ends_with('Z'));
+        assert_eq!(out.source_log.len(), 1);
+        assert_eq!(
+            out.source_log[0].content_hash.as_deref(),
+            Some(out.content_hash.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn web_fetch_never_routes_to_search_only_brave() {
+        let brave = Scripted::ok("brave", vec![]);
+        let tavily = Scripted::ok("tavily", vec![]);
+        let svc = router_service(vec![(&BRAVE_SPEC, brave.clone()), (&TAVILY_SPEC, tavily)]);
+
+        let out = svc
+            .web_fetch("https://docs.example/page", None)
+            .await
+            .expect("fetch");
+
+        assert_eq!(out.provider.as_deref(), Some("tavily"));
+        assert_eq!(brave.fetch_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_fetch_isolates_failures_and_shares_the_budget() {
+        let tavily = Scripted::ok("tavily", vec![]);
+        let svc = router_service(vec![(&TAVILY_SPEC, tavily)]);
+        let urls = vec![
+            "https://one.example/a".to_string(),
+            "https://broken.example/b".to_string(),
+            "https://three.example/c".to_string(),
+        ];
+
+        let out = svc
+            .web_fetch_batch(&urls, Some(40), &FetchOptions::default())
+            .await
+            .expect("batch");
+
+        assert_eq!(out.results.len(), 2);
+        assert_eq!(out.failed.len(), 1);
+        assert_eq!(out.failed[0].url, "https://broken.example/b");
+        let total: usize = out.results.iter().map(|r| r.content.chars().count()).sum();
+        assert!(total <= 40, "budget exceeded: {total}");
+        assert!(out.truncated);
+        let ids: Vec<(&str, &str)> = out
+            .source_log
+            .iter()
+            .map(|e| (e.source_id.as_str(), e.status.as_str()))
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                ("src_001", "success"),
+                ("src_002", "failed"),
+                ("src_003", "success")
+            ]
+        );
+        // Each result's hash matches its (possibly cut) content.
+        for result in &out.results {
+            assert_eq!(result.content_hash, sha256_hex(&result.content));
+            assert!(result.source_log.is_empty());
+        }
+    }
+
+    #[test]
+    fn provider_status_reports_order_and_no_secrets() {
+        let secret = "brave-secret-key-0123456789";
+        let config = Config::from_env_map([
+            ("BRAVE_API_KEY", secret),
+            ("TAVILY_API_KEY", "tvly-secret-key-0123456789"),
+        ]);
+        let svc = SearchService::new(config).expect("router mode needs no Grok");
+        let status = svc.provider_status();
+        let text = status.to_string();
+        assert!(!text.contains(secret), "{text}");
+        assert!(!text.contains("tvly-secret"), "{text}");
+        assert_eq!(status["engine"], "brave");
+        assert_eq!(status["providers"]["brave"]["configured"], true);
+        assert_eq!(status["providers"]["grok"]["configured"], false);
+        assert_eq!(status["providers"]["grok"]["required"], false);
+        assert_eq!(
+            status["web_search_order"]["quick"],
+            serde_json::json!(["brave", "tavily"])
+        );
+        assert_eq!(
+            status["web_search_order"]["deep"],
+            serde_json::json!(["tavily", "brave"])
+        );
+        assert_eq!(status["web_fetch_order"], serde_json::json!(["tavily"]));
+    }
+
+    #[test]
+    fn probe_errors_are_classified() {
+        assert_eq!(
+            classify_probe_error("Brave returned HTTP 401 Unauthorized: {}"),
+            "auth_error"
+        );
+        assert_eq!(
+            classify_probe_error("Tavily returned HTTP 432: plan limit"),
+            "rate_limited"
+        );
+        assert_eq!(
+            classify_probe_error("Brave request timed out: ..."),
+            "timeout"
+        );
+        assert_eq!(classify_probe_error("connection refused"), "error");
+        assert_eq!(
+            Probe::skipped("BRAVE_API_KEY not configured").status(),
+            "not_configured"
+        );
+        assert_eq!(Probe::not_checked().status(), "not_checked");
+    }
+
+    #[tokio::test]
+    async fn doctor_scope_skips_other_providers() {
+        let brave = Scripted::ok("brave", vec!["https://a.example/"]);
+        let tavily = Scripted::ok("tavily", vec!["https://t.example/"]);
+        let svc = router_service(vec![
+            (&BRAVE_SPEC, brave.clone()),
+            (&TAVILY_SPEC, tavily.clone()),
+        ]);
+
+        let report = svc.doctor_scoped(Some("brave")).await.expect("doctor");
+
+        assert_eq!(report["brave"]["status"], "ok");
+        assert_eq!(report["tavily"]["status"], "not_checked");
+        assert_eq!(report["grok"]["status"], "not_checked");
+        assert_eq!(tavily.calls.load(Ordering::SeqCst), 0);
+        assert!(svc.doctor_scoped(Some("bing")).await.is_err());
     }
 }

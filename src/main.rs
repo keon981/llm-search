@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Write};
 
-use grok_search_rs::config::{self, AuthMode, Config, InitOutcome};
+use llm_search::config::{self, AuthMode, Config, InitOutcome};
 
 fn main() -> anyhow::Result<()> {
     build_runtime()?.block_on(async_main())
@@ -32,7 +32,7 @@ async fn async_main() -> anyhow::Result<()> {
         .iter()
         .any(|a| a == "--version" || a == "-V" || a == "-v")
     {
-        println!("grok-search-rs {}", env!("CARGO_PKG_VERSION"));
+        println!("llm-search {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 
@@ -69,7 +69,7 @@ async fn async_main() -> anyhow::Result<()> {
                 .parse()
                 .map_err(|err| anyhow::anyhow!("invalid GROK_MCP_BIND '{addr}': {err}"))?;
             let base_env: std::collections::HashMap<String, String> = std::env::vars().collect();
-            return grok_search_rs::http::run_http(base_env, bind).await;
+            return llm_search::http::run_http(base_env, bind).await;
         }
     }
 
@@ -86,17 +86,17 @@ async fn async_main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let service = grok_search_rs::service::SearchService::new(cfg)?;
-    grok_search_rs::mcp::run_stdio(service).await?;
+    let service = llm_search::service::SearchService::new(cfg)?;
+    llm_search::mcp::run_stdio(service).await?;
     Ok(())
 }
 
 async fn run_login(cfg: &Config) -> anyhow::Result<()> {
     let path = resolve_auth_path(cfg)?;
-    let store = grok_search_rs::oauth::login::login(&path, true).await?;
+    let store = llm_search::oauth::login::login(&path, true).await?;
     println!("Login successful.");
     println!("Auth file: {}", path.display());
-    if let Some(exp) = grok_search_rs::oauth::token_store::jwt_exp(&store.access_token) {
+    if let Some(exp) = llm_search::oauth::token_store::jwt_exp(&store.access_token) {
         println!("Access token expires at unix time: {exp}");
     }
     Ok(())
@@ -104,8 +104,8 @@ async fn run_login(cfg: &Config) -> anyhow::Result<()> {
 
 fn run_status(cfg: &Config) -> anyhow::Result<()> {
     let path = resolve_auth_path(cfg)?;
-    let status = grok_search_rs::oauth::token_store::auth_status(&path);
-    println!("grok-search-rs OAuth status");
+    let status = llm_search::oauth::token_store::auth_status(&path);
+    println!("llm-search OAuth status");
     println!("  Auth file: {}", status.path.display());
     println!(
         "  Authenticated: {}",
@@ -135,7 +135,7 @@ fn run_status(cfg: &Config) -> anyhow::Result<()> {
 
 fn run_logout(cfg: &Config) -> anyhow::Result<()> {
     let path = resolve_auth_path(cfg)?;
-    let removed = grok_search_rs::oauth::token_store::delete_token_store(&path)?;
+    let removed = llm_search::oauth::token_store::delete_token_store(&path)?;
     if removed {
         println!("Removed OAuth token file: {}", path.display());
     } else {
@@ -175,28 +175,33 @@ fn run_init() -> anyhow::Result<()> {
 
 fn print_setup_guide() {
     let mut guide = String::from(
-        r#"grok-search-rs is an MCP server. It speaks JSON-RPC over stdio and
+        r#"llm-search is an MCP server. It speaks JSON-RPC over stdio and
 should be launched by an MCP client (Claude Code, Codex CLI, Gemini CLI,
 Cursor, VS Code, Windsurf, ...), not run directly.
 
-Required keys
-  GROK_SEARCH_API_KEY   xAI / Grok-compatible key   (https://x.ai/api)
-  TAVILY_API_KEY        Tavily fetch + map          (https://tavily.com)
+web_search engine (LLM_SEARCH_PROVIDER)
+  brave (default)       Brave / Tavily router: quick | deep | verify
+  grok                  Grok answer + source chain (needs GROK_SEARCH_API_KEY)
+
+Keys
+  BRAVE_API_KEY         Brave Search                (https://brave.com/search/api/)
+  TAVILY_API_KEY        Tavily search + fetch + map (https://tavily.com)
+  GROK_SEARCH_API_KEY   only for LLM_SEARCH_PROVIDER=grok (https://x.ai/api)
   FIRECRAWL_API_KEY     optional fetch fallback     (https://firecrawl.dev)
   TINYFISH_API_KEY      optional free search+fetch  (https://tinyfish.ai)
   EXA_API_KEY           optional semantic search    (https://exa.ai)
 
 OAuth alternative
-  grok-search-rs login
+  llm-search login
   Set GROK_SEARCH_AUTH_MODE=oauth in your MCP env or config.
   OAuth mode reuses Hermes' xAI client_id and may carry account / terms risk.
 
 One-line install (Claude Code)
-  claude mcp add-json grok-search-rs --scope user '{
+  claude mcp add-json llm-search --scope user '{
     "type": "stdio",
-    "command": "grok-search-rs",
+    "command": "/path/to/llm-search",
     "env": {
-      "GROK_SEARCH_API_KEY": "xai-...",
+      "BRAVE_API_KEY": "BSA...",
       "TAVILY_API_KEY": "tvly-..."
     }
   }'
@@ -210,7 +215,7 @@ One-line install (Claude Code)
         if !path.exists() {
             guide.push_str(&format!(
                 r#"Tip: set keys once for every MCP client
-  grok-search-rs --init                  # scaffold {}
+  llm-search --init                      # scaffold {}
   $EDITOR {}    # uncomment and fill
 
 "#,

@@ -6,9 +6,9 @@
 //!   GROK_SEARCH_E2E_CHAT_MODEL=grok-4-1-fast-reasoning \
 //!   cargo test --test integration_service -- --ignored --nocapture
 
-use grok_search_rs::config::{Config, Transport};
-use grok_search_rs::model::tool::WebSearchInput;
-use grok_search_rs::service::SearchService;
+use llm_search::config::{Config, Transport};
+use llm_search::model::tool::WebSearchInput;
+use llm_search::service::SearchService;
 
 #[tokio::test(flavor = "current_thread")]
 #[ignore]
@@ -19,6 +19,7 @@ async fn full_service_web_search_via_chat_completions() {
         std::env::var("GROK_SEARCH_E2E_CHAT_MODEL").unwrap_or_else(|_| "grok-4.3-fast".to_string());
 
     let config = Config::from_env_map([
+        ("LLM_SEARCH_PROVIDER", "grok"),
         ("OPENAI_COMPATIBLE_API_URL", url.as_str()),
         ("OPENAI_COMPATIBLE_API_KEY", key.as_str()),
         ("OPENAI_COMPATIBLE_MODEL", model.as_str()),
@@ -39,6 +40,8 @@ async fn full_service_web_search_via_chat_completions() {
             model: None,
             include_content: None,
             response_format: None,
+            mode: None,
+            max_results: None,
         })
         .await
         .expect("web_search");
