@@ -1,6 +1,6 @@
 {
-  "name": "@k/llm-search",
-  "version": "0.1.0",
+  "name": "@keon981/llm-search",
+  "version": "0.2.0",
   "description": "MCP server for Brave/Tavily-routed web search with multi-provider page fetch (prebuilt Rust binary)",
   "publishConfig": {
     "access": "public"
@@ -44,10 +44,10 @@
     "arm64"
   ],
   "optionalDependencies": {
-    "@k/llm-search-darwin-universal": "0.1.0",
-    "@k/llm-search-linux-x64": "0.1.0",
-    "@k/llm-search-linux-arm64": "0.1.0",
-    "@k/llm-search-win32-x64": "0.1.0",
-    "@k/llm-search-win32-arm64": "0.1.0"
+    "@keon981/llm-search-darwin-universal": "0.2.0",
+    "@keon981/llm-search-linux-x64": "0.2.0",
+    "@keon981/llm-search-linux-arm64": "0.2.0",
+    "@keon981/llm-search-win32-x64": "0.2.0",
+    "@keon981/llm-search-win32-arm64": "0.2.0"
   }
 }

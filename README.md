@@ -46,7 +46,7 @@
 npm 套件內附各平台編好的執行檔（macOS universal、Linux x64 / arm64、Windows x64 / arm64），不需要 Rust。
 
 ```bash
-vp install -g @k/llm-search     # 或 npm install -g @k/llm-search
+vp install -g @keon981/llm-search     # 或 npm install -g @keon981/llm-search
 llm-search --version
 ```
 

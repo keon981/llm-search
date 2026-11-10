@@ -31,3 +31,6 @@
 # Stray build/output dumps
 /rust_out
 /stdin
+
+# binaries unpacked by scripts/publish-npm.sh
+npm/platforms/*/bin/
