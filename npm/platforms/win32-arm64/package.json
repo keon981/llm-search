@@ -1,11 +1,11 @@
 {
-  "name": "@epsiekygrr_zedxx/grok-search-rs-win32-arm64",
-  "version": "0.1.26",
-  "description": "Windows arm64 binary for grok-search-rs",
+  "name": "@k/llm-search-win32-arm64",
+  "version": "0.1.0",
+  "description": "Windows arm64 binary for llm-search",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Episkey-G/GrokSearch-rs.git"
+    "url": "git+https://github.com/keon981/llm-search.git"
   },
   "os": [
     "win32"
@@ -14,7 +14,7 @@
     "arm64"
   ],
   "files": [
-    "bin/grok-search-rs.exe"
+    "bin/llm-search.exe"
   ],
   "preferUnplugged": true,
   "publishConfig": {

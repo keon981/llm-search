@@ -4,14 +4,14 @@ const { spawn } = require("child_process");
 const path = require("path");
 const os = require("os");
 
-const PACKAGE_NAME = "grok-search-rs";
+const PACKAGE_NAME = "llm-search";
 const PLATFORMS = {
-  "darwin-x64": "@epsiekygrr_zedxx/grok-search-rs-darwin-universal",
-  "darwin-arm64": "@epsiekygrr_zedxx/grok-search-rs-darwin-universal",
-  "linux-x64": "@epsiekygrr_zedxx/grok-search-rs-linux-x64",
-  "linux-arm64": "@epsiekygrr_zedxx/grok-search-rs-linux-arm64",
-  "win32-x64": "@epsiekygrr_zedxx/grok-search-rs-win32-x64",
-  "win32-arm64": "@epsiekygrr_zedxx/grok-search-rs-win32-arm64",
+  "darwin-x64": "@k/llm-search-darwin-universal",
+  "darwin-arm64": "@k/llm-search-darwin-universal",
+  "linux-x64": "@k/llm-search-linux-x64",
+  "linux-arm64": "@k/llm-search-linux-arm64",
+  "win32-x64": "@k/llm-search-win32-x64",
+  "win32-arm64": "@k/llm-search-win32-arm64",
 };
 
 function getBinaryPath() {
@@ -33,7 +33,7 @@ function getBinaryPath() {
     console.error("This may happen if npm failed to install the optional dependency.");
     console.error("");
     console.error("Try reinstalling:");
-    console.error(`  npm install ${PACKAGE_NAME}`);
+    console.error(`  npm install @k/llm-search`);
     console.error("");
     console.error("Or install the platform package directly:");
     console.error(`  npm install ${pkgName}`);

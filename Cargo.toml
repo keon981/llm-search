@@ -6,8 +6,8 @@ rust-version = "1.78"
 description = "MCP server for Brave/Tavily-routed web search (Grok optional) with multi-provider page fetch; fork of GrokSearch-rs"
 license = "MIT"
 readme = "README.md"
-repository = "https://github.com/Episkey-G/GrokSearch-rs"
-homepage = "https://github.com/Episkey-G/GrokSearch-rs"
+repository = "https://github.com/keon981/llm-search"
+homepage = "https://github.com/keon981/llm-search"
 keywords = ["mcp", "brave", "tavily", "grok", "search"]
 categories = ["command-line-utilities", "web-programming"]
 

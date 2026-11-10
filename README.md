@@ -43,22 +43,19 @@
 
 ## 安裝
 
-需要 Rust 1.78 以上。
+npm 套件內附各平台編好的執行檔（macOS universal、Linux x64 / arm64、Windows x64 / arm64），不需要 Rust。
 
 ```bash
-cd llm-search
-cargo build --release
+vp install -g @k/llm-search     # 或 npm install -g @k/llm-search
+llm-search --version
 ```
 
-執行檔在 `target/release/llm-search`。MCP client 的 `command` 指向它的絕對路徑。
+更新：再跑一次同一行安裝指令。
 
 ### 註冊到 Claude Code
 
 ```bash
-claude mcp add llm-search -s user \
-  -e BRAVE_API_KEY=YOUR_BRAVE_KEY \
-  -e TAVILY_API_KEY=YOUR_TAVILY_KEY \
-  -- /absolute/path/to/llm-search/target/release/llm-search
+claude mcp add llm-search -s user -e BRAVE_API_KEY=YOUR_BRAVE_KEY -e TAVILY_API_KEY=YOUR_TAVILY_KEY -- llm-search
 ```
 
 註冊後設定存在 `~/.claude.json` 的 `mcpServers.llm-search.env`，可在那裡把佔位文字換成真的 key。開新 session 後先呼叫 `provider_status` 確認。
@@ -68,7 +65,7 @@ claude mcp add llm-search -s user \
 ```toml
 [mcp_servers.llm-search]
 type = "stdio"
-command = "/absolute/path/to/llm-search/target/release/llm-search"
+command = "llm-search"
 
 [mcp_servers.llm-search.env]
 BRAVE_API_KEY = ""
@@ -147,6 +144,12 @@ GROK_MCP_BIND=127.0.0.1:8080 target/release-http/llm-search --http
 ---
 
 ## 開發
+
+從原始碼建置需要 Rust 1.78 以上：
+
+```bash
+cargo build --release   # 執行檔在 target/release/llm-search
+```
 
 ```bash
 cargo fmt --check

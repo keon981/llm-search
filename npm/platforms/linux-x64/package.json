@@ -1,11 +1,11 @@
 {
-  "name": "@epsiekygrr_zedxx/grok-search-rs-linux-x64",
-  "version": "0.1.26",
-  "description": "Linux x64 binary for grok-search-rs",
+  "name": "@k/llm-search-linux-x64",
+  "version": "0.1.0",
+  "description": "Linux x64 binary for llm-search",
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Episkey-G/GrokSearch-rs.git"
+    "url": "git+https://github.com/keon981/llm-search.git"
   },
   "os": [
     "linux"
@@ -14,7 +14,7 @@
     "x64"
   ],
   "files": [
-    "bin/grok-search-rs"
+    "bin/llm-search"
   ],
   "preferUnplugged": true,
   "publishConfig": {

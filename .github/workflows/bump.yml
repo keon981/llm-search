@@ -71,7 +71,7 @@ jobs:
           PY
 
       - name: Update Cargo.lock
-        run: cargo update -p grok-search-rs
+        run: cargo update -p llm-search
 
       - name: Update npm package.json files
         env:
@@ -82,7 +82,7 @@ jobs:
           const path = require('path');
           const version = process.env.NEW_VERSION;
 
-          const mainPath = 'npm/grok-search-rs/package.json';
+          const mainPath = 'npm/llm-search/package.json';
           const main = JSON.parse(fs.readFileSync(mainPath, 'utf8'));
           main.version = version;
           if (main.optionalDependencies) {
@@ -122,12 +122,12 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock npm/grok-search-rs/package.json npm/platforms/*/package.json
+          git add Cargo.toml Cargo.lock npm/llm-search/package.json npm/platforms/*/package.json
           if git diff --cached --quiet; then
             echo "No changes to commit (already at v${NEW_VERSION})." >&2
             exit 1
           fi
-          git commit -m "Release grok-search-rs ${NEW_VERSION}"
+          git commit -m "Release llm-search ${NEW_VERSION}"
           git tag -a "v${NEW_VERSION}" -m "v${NEW_VERSION}"
           git push origin HEAD:${GITHUB_REF_NAME}
           git push origin "v${NEW_VERSION}"

@@ -1,0 +1,53 @@
+{
+  "name": "@k/llm-search",
+  "version": "0.1.0",
+  "description": "MCP server for Brave/Tavily-routed web search with multi-provider page fetch (prebuilt Rust binary)",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/keon981/llm-search.git"
+  },
+  "author": "keon981",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/keon981/llm-search/issues"
+  },
+  "homepage": "https://github.com/keon981/llm-search#readme",
+  "keywords": [
+    "mcp",
+    "brave",
+    "tavily",
+    "web-search",
+    "claude-code",
+    "rust",
+    "cli"
+  ],
+  "bin": {
+    "llm-search": "run.js"
+  },
+  "files": [
+    "run.js",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=14.14.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "optionalDependencies": {
+    "@k/llm-search-darwin-universal": "0.1.0",
+    "@k/llm-search-linux-x64": "0.1.0",
+    "@k/llm-search-linux-arm64": "0.1.0",
+    "@k/llm-search-win32-x64": "0.1.0",
+    "@k/llm-search-win32-arm64": "0.1.0"
+  }
+}

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Bump grok-search-rs version across Cargo.toml, Cargo.lock,
+# Bump llm-search version across Cargo.toml, Cargo.lock,
 # and all npm package.json files (main + platform sub-packages).
 #
 # Usage:
@@ -59,7 +59,7 @@ p.write_text(new_text)
 PY
 
 echo "==> Refreshing Cargo.lock"
-cargo update -p grok-search-rs
+cargo update -p llm-search
 
 echo "==> Updating npm package.json files"
 NEW_VERSION="$VERSION" node - <<'NODE'
@@ -67,7 +67,7 @@ const fs = require('fs');
 const path = require('path');
 const version = process.env.NEW_VERSION;
 
-const mainPath = 'npm/grok-search-rs/package.json';
+const mainPath = 'npm/llm-search/package.json';
 const main = JSON.parse(fs.readFileSync(mainPath, 'utf8'));
 main.version = version;
 if (main.optionalDependencies) {
@@ -100,8 +100,8 @@ if [[ "$MODE" == "bump" ]]; then
 fi
 
 echo "==> Committing"
-git add Cargo.toml Cargo.lock npm/grok-search-rs/package.json npm/platforms/*/package.json
-git commit -m "Release grok-search-rs $VERSION"
+git add Cargo.toml Cargo.lock npm/llm-search/package.json npm/platforms/*/package.json
+git commit -m "Release llm-search $VERSION"
 git tag -a "v$VERSION" -m "v$VERSION"
 
 if [[ "$MODE" == "push" ]]; then

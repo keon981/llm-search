@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Cross-compile the static musl binaries Dockerfile.deploy expects and lay
-# them out as dist/<docker-platform>/grok-search-rs:
-#   dist/linux/amd64/grok-search-rs
-#   dist/linux/arm64/grok-search-rs
+# them out as dist/<docker-platform>/llm-search:
+#   dist/linux/amd64/llm-search
+#   dist/linux/arm64/llm-search
 #
 # Usage:
 #   scripts/build-deploy-dist.sh               # every supported platform
@@ -41,8 +41,8 @@ for platform in "${PLATFORMS[@]}"; do
   mkdir -p "dist/$platform"
   # install(1), not cp: pin mode 0755 regardless of umask — docker COPY keeps
   # the staged mode and the image runs as non-root, so 0700 here bricks it.
-  install -m 0755 "target/$target/release-http/grok-search-rs" "dist/$platform/grok-search-rs"
+  install -m 0755 "target/$target/release-http/llm-search" "dist/$platform/llm-search"
 done
 
 echo "==> dist/ ready:"
-ls -l dist/*/*/grok-search-rs
+ls -l dist/*/*/llm-search
