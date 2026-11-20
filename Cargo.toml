@@ -1,6 +1,6 @@
 [package]
 name = "llm-search"
-version = "0.1.26"
+version = "0.2.1"
 edition = "2021"
 rust-version = "1.78"
 description = "MCP server for Brave/Tavily-routed web search (Grok optional) with multi-provider page fetch; fork of GrokSearch-rs"
