@@ -16,7 +16,7 @@ pub mod wikipedia;
 /// specialist was ever attempted.
 pub const NO_SPECIALIST_MATCH: &str = "no_specialist_match";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceType {
     GithubIssue,
@@ -25,6 +25,7 @@ pub enum SourceType {
     Stackexchange,
     Arxiv,
     Wikipedia,
+    #[default]
     Generic,
 }
 

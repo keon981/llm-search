@@ -213,7 +213,9 @@ pub async fn get_json_with_header_auth(
 /// Send a prepared JSON request and normalize transport / status / parse
 /// failures into `HttpFailure`. Shared by the bearer- and header-auth helpers
 /// so every provider gets identical error handling (including the SSE path).
-async fn send_json(
+/// Crate-visible so a provider can build its own request (per-request
+/// timeout, GET with bearer auth) and keep the same error normalization.
+pub(crate) async fn send_json(
     request: reqwest::RequestBuilder,
     label: &str,
 ) -> std::result::Result<Value, HttpFailure> {

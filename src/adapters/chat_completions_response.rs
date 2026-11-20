@@ -4,7 +4,7 @@ use crate::model::search::SearchResponse;
 use crate::model::source::Source;
 use serde_json::Value;
 
-const PROVIDER_LABEL: &str = "openai_compatible";
+const PROVIDER_LABEL: &str = "grok_chat_completions";
 
 /// Parse an OpenAI-style chat-completions response. Source extraction runs
 /// four paths in priority order, then de-dupes by URL preserving order:

@@ -9,7 +9,8 @@ use crate::service::SearchService;
 const NATIVE_SEARCH_FALLBACK_HINT: &str = "If llm-search keeps failing, fall back to the client's built-in web search (Claude Code: WebSearch) and tell the user that the llm-search MCP failed.";
 
 /// Most URLs one `web_fetch` call accepts through `urls`.
-const MAX_FETCH_URLS: usize = 10;
+/// Matches Tavily Extract's per-call limit, so one batch call covers them all.
+const MAX_FETCH_URLS: usize = 20;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::task::JoinSet;
@@ -97,6 +98,42 @@ where
     Ok(())
 }
 
+/// Server-level usage guide returned as `instructions` in the `initialize`
+/// result (defined in the 2025-11-25 schema; the 2024-11-05 schema has no such
+/// field). Tool descriptions say what each tool does; this says which tool to
+/// pick and how to search well. Kept ASCII and within 2,048 UTF-16 code units:
+/// Claude Code truncates server instructions at 4,096 units today and did so
+/// at 2,048 in older releases, so the smaller cap is safe on both. The test
+/// `instructions_fit_client_budget_and_name_every_tool` enforces the cap.
+pub(crate) const SERVER_INSTRUCTIONS: &str = "\
+llm-search: live web search and page reading with source provenance.\n\
+\n\
+Pick the tool:\n\
+- Have a URL -> web_fetch (url, or urls for up to 20 pages). Do not search for a page you can fetch.\n\
+- Need sources or current facts -> web_search.\n\
+- Know the site but not the page -> web_map, then web_fetch the right URL.\n\
+- Need many pages of one site section -> web_crawl (local runs write a file; read it in parts).\n\
+- User asks for research or a report -> web_search mode=research with a full task description (never on your own; it is slow and costly).\n\
+- Re-read sources from an earlier web_search -> get_sources with its session_id (no new search or quota).\n\
+- Setup check or repeated failures -> provider_status first (free); doctor makes live calls and uses quota.\n\
+\n\
+web_search modes (quick/deep/verify need engine brave; research runs on any):\n\
+- quick (default): cheapest. Discovery, docs, URLs, news.\n\
+- deep: Tavily advanced with an answer and page text. Use when the answer needs page content.\n\
+- verify: Brave and Tavily in parallel, merged. For important or disputed claims; costs both quotas.\n\
+\n\
+Queries:\n\
+- Write the keywords a matching page would contain (official names, versions, exact error text), not a full question and not the answer you expect.\n\
+- Split a multi-part question into one search per part; issue independent searches in parallel.\n\
+- Narrow with recency_days or time_range/start_date/end_date, include_domains and exclude_domains instead of writing dates or site: into the query.\n\
+- Tavily-only options (topic, search_depth, include_answer, ...) apply only when Tavily serves; warnings say when they were ignored.\n\
+\n\
+Results:\n\
+- Cite sources by source_id (src_001). A provider-written answer is a summary to check against sources, never a source itself.\n\
+- When notice is present, a fallback provider served the result: tell the user.\n\
+- When truncated=true, recover the text with get_sources or web_fetch.\n\
+- Count independent sources, not results. Confirm releases, versions and official decisions on the official domain.";
+
 /// Protocol revisions this server speaks, newest first. `initialize` echoes the
 /// client's requested version when it is one of these — so existing stdio
 /// clients that still request "2024-11-05" keep getting "2024-11-05" — and
@@ -161,7 +198,8 @@ async fn handle_request(service: &SearchService, request: Value) -> Result<Value
                     },
                     "capabilities": {
                         "tools": {}
-                    }
+                    },
+                    "instructions": SERVER_INSTRUCTIONS
                 }),
             ))
         }
@@ -208,9 +246,33 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
         }
         "provider_status" => Ok(service.provider_status()),
         "web_search" => {
-            let query = args.get("query").and_then(Value::as_str).ok_or_else(|| {
-                GrokSearchError::InvalidParams("web_search.query is required".into())
-            })?;
+            let is_research = args.get("mode").and_then(Value::as_str) == Some("research");
+            let (research, research_id) = if is_research {
+                crate::tool_params::parse_research_params(&args)?
+            } else {
+                Default::default()
+            };
+            // Resuming a research task needs only its id.
+            let query = match args.get("query").and_then(Value::as_str) {
+                Some(query) => query,
+                None if research_id.is_some() => "",
+                None => {
+                    return Err(GrokSearchError::InvalidParams(
+                        "web_search.query is required".into(),
+                    ))
+                }
+            };
+            let recency_days = args
+                .get("recency_days")
+                .and_then(Value::as_u64)
+                .map(|value| value as u32)
+                .filter(|value| *value > 0);
+            let include_domains = parse_string_array(args.get("include_domains"));
+            let ext = crate::tool_params::parse_search_extensions(
+                &args,
+                recency_days.is_some(),
+                !include_domains.is_empty(),
+            )?;
             let input = WebSearchInput {
                 query: query.to_string(),
                 // model/platform are intentionally NOT read from tool input: the
@@ -226,12 +288,8 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                     .get("extra_sources")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
-                recency_days: args
-                    .get("recency_days")
-                    .and_then(Value::as_u64)
-                    .map(|value| value as u32)
-                    .filter(|value| *value > 0),
-                include_domains: parse_string_array(args.get("include_domains")),
+                recency_days,
+                include_domains,
                 exclude_domains: parse_string_array(args.get("exclude_domains")),
                 include_content: args.get("include_content").and_then(Value::as_bool),
                 response_format: args
@@ -243,6 +301,13 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                     .get("max_results")
                     .and_then(Value::as_u64)
                     .map(|value| value as usize),
+                time_range: ext.time_range,
+                start_date: ext.start_date,
+                end_date: ext.end_date,
+                hints: ext.hints,
+                tavily: ext.tavily,
+                research,
+                research_id,
             };
             let output = service
                 .web_search(input)
@@ -298,18 +363,40 @@ async fn call_tool(service: &SearchService, name: &str, args: Value) -> Result<V
                 .get("url")
                 .and_then(Value::as_str)
                 .ok_or_else(|| GrokSearchError::InvalidParams("web_map.url is required".into()))?;
-            let max_results = args
-                .get("max_results")
-                .and_then(Value::as_u64)
-                .unwrap_or(10) as usize;
-            let sources = service.web_map(url, max_results).await?;
-            let mapped_sources: Vec<Value> = sources
+            // Tavily also accepts a bare domain (`docs.tavily.com`), so the
+            // URL is not forced to http(s) here.
+            let params = crate::tool_params::parse_site_params(&args, "web_map", false)?;
+            let mapped = service.web_map_with(url, &params).await?;
+            let mapped_sources: Vec<Value> = mapped
+                .sources
                 .iter()
                 .map(|source| json!({ "url": &source.url, "provider": &source.provider }))
                 .collect();
-            Ok(
-                json!({ "url": url, "sources_count": mapped_sources.len(), "sources": mapped_sources }),
-            )
+            let mut out = json!({
+                "url": url,
+                "sources_count": mapped_sources.len(),
+                "sources": mapped_sources,
+            });
+            let object = out.as_object_mut().expect("literal object");
+            if let Some(base) = mapped.base_url {
+                object.insert("base_url".into(), Value::String(base));
+            }
+            if let Some(id) = mapped.request_id {
+                object.insert("request_id".into(), Value::String(id));
+            }
+            if let Some(usage) = mapped.usage {
+                object.insert("usage".into(), usage);
+            }
+            Ok(out)
+        }
+        "web_crawl" => {
+            let url = args.get("url").and_then(Value::as_str).ok_or_else(|| {
+                GrokSearchError::InvalidParams("web_crawl.url is required".into())
+            })?;
+            let params = crate::tool_params::parse_site_params(&args, "web_crawl", true)?;
+            let output = service.web_crawl(url, &params).await?;
+            serde_json::to_value(output)
+                .map_err(|err| GrokSearchError::Parse(format!("serialize crawl: {err}")))
         }
         _ => Err(GrokSearchError::NotFound(format!("unknown tool: {name}"))),
     }
@@ -320,33 +407,89 @@ fn tools_list() -> Value {
         "tools": [
             {
                 "name": "web_search",
-                "description": "Search the live web. Use for discovery and current facts when you do not have a URL; if the user gave an exact URL, call web_fetch on it first. The server's engine (LLM_SEARCH_PROVIDER) decides the pipeline: `brave` (default) routes Brave / Tavily by `mode` — quick (default): Brave first, Tavily fallback, for broad discovery, docs, URLs, news; deep: Tavily advanced first with a Tavily answer and inline page text, for research; verify: Brave and Tavily in parallel, merged, for important claims that need cross-checking. `grok` returns a Grok-written answer plus sources (mode is ignored). Every result has `source_log` (cite sources by `source_id`, e.g. src_001). When `notice` is present a fallback provider served the result: say so in your answer. When truncated=true, recover trimmed text via web_fetch or get_sources.",
+                "description": "Search the live web. Use for discovery and current facts when you do not have a URL; if the user gave an exact URL, call web_fetch on it first. The server's engine (LLM_SEARCH_PROVIDER) decides the pipeline: `brave` (default) routes Brave / Tavily by `mode` — quick (default): Brave first, Tavily fallback, for broad discovery, docs, URLs, news; deep: Tavily advanced first with a Tavily answer and inline page text, for research; verify: Brave and Tavily in parallel, merged, for important claims that need cross-checking. `grok` returns a Grok-written answer plus sources (mode is ignored). Tavily-only parameters apply only when Tavily serves (deep, verify, or quick after a Brave failure); otherwise `warnings` lists them as ignored. Every result has `source_log` (cite sources by `source_id`, e.g. src_001). When `notice` is present a fallback provider served the result: say so in your answer. When truncated=true, recover trimmed text via web_fetch or get_sources.",
                 "inputSchema": {
                     "type": "object",
                     "required": ["query"],
                     "properties": {
-                        "query": { "type": "string" },
+                        "query": { "type": "string", "description": "Search keywords; for mode=research a full task description. Pass an empty string when resuming with research_id." },
                         "mode": {
                             "type": "string",
-                            "enum": ["quick", "deep", "verify"],
-                            "description": "Router mode (engine `brave` only). quick = Brave then Tavily (cheapest); deep = Tavily advanced then Brave, with answer and page text; verify = Brave + Tavily in parallel, merged (costs both)."
+                            "enum": ["quick", "deep", "verify", "research"],
+                            "description": "quick = Brave then Tavily (cheapest); deep = Tavily advanced then Brave, with answer and page text (default orders; the operator may reorder them, provider_status shows the live order); verify = Brave + Tavily in parallel, merged (costs both) — these three need engine `brave`. research = Tavily Research report (any engine): ONLY when the user asks for research; query is a full task description, not keywords."
                         },
+                        "research_model": { "type": "string", "enum": ["mini", "pro", "auto"], "description": "mode=research. mini for a narrow question, pro for a broad multi-part topic, auto (default) lets Tavily pick." },
+                        "output_schema": { "type": "object", "description": "mode=research. JSON Schema (with `properties`) for a structured report; content is then that JSON." },
+                        "citation_format": { "type": "string", "enum": ["numbered", "mla", "apa", "chicago"], "description": "mode=research. Citation style (default numbered)." },
+                        "output_length": { "type": "string", "enum": ["short", "standard", "long"], "description": "mode=research. Report length (default standard)." },
+                        "research_id": { "type": "string", "description": "mode=research. Resume waiting on a task an earlier call returned as still running; query may be omitted." },
                         "max_results": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": 10,
+                            "maximum": 20,
                             "description": "Results to return (engine `brave` only). Default 5."
                         },
                         "extra_sources": {
                             "type": "integer",
                             "minimum": 0,
-                            "description": "Engine `grok` only: supplemental source count, served by the configured source chain (default order: Tavily, then Exa, TinyFish, Firecrawl, Brave — first provider with results wins; GROK_SEARCH_SOURCE_PROVIDERS overrides). If omitted, GROK_SEARCH_EXTRA_SOURCES is used. Use max_results with engine `brave`."
+                            "description": "Engine `grok` only: supplemental source count, served by the configured source chain (default order: Tavily, then Exa, TinyFish, Firecrawl, Brave — first provider with results wins; LLM_SEARCH_SOURCE_PROVIDERS overrides). If omitted, GROK_SEARCH_EXTRA_SOURCES is used. Use max_results with engine `brave`."
                         },
                         "recency_days": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Restrict results to sources published within the last N days. Honored natively by Brave (freshness), Tavily (days+topic=news), Exa (startPublishedDate), and TinyFish (recency window); providers that cannot honor filters (Firecrawl) are skipped for filtered requests. Also hinted to the Grok prompt."
+                            "description": "Restrict results to sources published within the last N days. Honored natively by Brave (freshness), Tavily (start_date), Exa (startPublishedDate), and TinyFish (recency window); providers that cannot honor filters (Firecrawl) are skipped for filtered requests. Also hinted to the Grok prompt. Use only one of recency_days, time_range, start_date/end_date."
                         },
+                        "time_range": {
+                            "type": "string",
+                            "enum": ["day", "week", "month", "year"],
+                            "description": "Relative publish window (strict filter): Brave pd/pw/pm/py, Tavily time_range, Exa/TinyFish as a start bound. Tavily keeps undated pages unless filter_by_published_date=true."
+                        },
+                        "start_date": {
+                            "type": "string",
+                            "description": "Earliest publish date, YYYY-MM-DD (strict filter). Brave freshness range, Tavily start_date, Exa startPublishedDate, TinyFish start bound."
+                        },
+                        "end_date": {
+                            "type": "string",
+                            "description": "Latest publish date, YYYY-MM-DD (strict filter). Brave, Tavily and Exa honor it; TinyFish and Firecrawl are skipped."
+                        },
+                        "country": {
+                            "type": "string",
+                            "description": "Boost results from a country: ISO 3166-1 alpha-2 code (TW, US) or English name. Hint: Brave country, Tavily country (general topic only); other providers ignore it."
+                        },
+                        "language": {
+                            "type": "string",
+                            "description": "Result language code, forwarded as given: Brave search_lang, Tavily language (boost; filter_by_language=true makes Tavily strict). A value a provider rejects makes it fail over."
+                        },
+                        "safe_search": {
+                            "type": "boolean",
+                            "description": "Filter adult content: Brave safesearch strict/off (unset = moderate), Tavily safe_search (not with search_depth fast/ultra-fast)."
+                        },
+                        "exact_match": {
+                            "type": "boolean",
+                            "description": "Only results containing the quoted phrase(s) in query (Tavily exact_match; Brave already treats quotes as exact)."
+                        },
+                        "topic": {
+                            "type": "string",
+                            "enum": ["general", "news", "finance"],
+                            "description": "Tavily only. Search category; default general."
+                        },
+                        "search_depth": {
+                            "type": "string",
+                            "enum": ["basic", "advanced", "fast", "ultra-fast"],
+                            "description": "Tavily only. Overrides the mode default (quick basic, deep/verify advanced). advanced costs 2 credits, others 1."
+                        },
+                        "chunks_per_source": { "type": "integer", "minimum": 1, "maximum": 3, "description": "Tavily only. Snippets per result (default 3)." },
+                        "include_answer": { "type": ["boolean", "string"], "description": "Tavily only. true/basic or advanced generated answer; overrides the mode default." },
+                        "include_raw_content": { "type": ["boolean", "string"], "description": "Tavily only. Page text per result: true/markdown or text; overrides the mode default." },
+                        "include_images": { "type": "boolean", "description": "Tavily only. Query images in `images`." },
+                        "include_image_descriptions": { "type": "boolean", "description": "Tavily only. Describe each image (with include_images)." },
+                        "include_favicon": { "type": "boolean", "description": "Tavily only. favicon per source." },
+                        "include_domains_mode": { "type": "string", "enum": ["restrict", "prefer"], "description": "Tavily only. prefer = rank include_domains first without excluding others. Needs include_domains." },
+                        "include_published_date": { "type": "boolean", "description": "Tavily only. published_date per source." },
+                        "filter_by_published_date": { "type": "boolean", "description": "Tavily only. Drop results outside the window, including undated ones." },
+                        "filter_by_language": { "type": "boolean", "description": "Tavily only. Make language a strict filter. Needs language." },
+                        "auto_parameters": { "type": "boolean", "description": "Tavily only. Let Tavily pick parameters from the query (may use advanced depth, 2 credits)." },
+                        "include_usage": { "type": "boolean", "description": "Tavily only. Credit usage in `usage`." },
                         "include_domains": {
                             "type": "array",
                             "items": { "type": "string" },
@@ -393,7 +536,7 @@ fn tools_list() -> Value {
             },
             {
                 "name": "web_fetch",
-                "description": "Read exact pages. Use first whenever the user supplies a URL; use after web_search when the answer needs source text. GitHub issue/PR, StackOverflow (StackExchange), arXiv, and Wikipedia URLs are parsed into structured Markdown; other pages go through Tavily Extract, then Exa, TinyFish, Firecrawl (first that returns content). Pass `url` for one page or `urls` (up to 10) for several. Returns content with provenance: provider, content_hash (SHA-256 of the returned content), extracted_at, and source_log. Only http(s) URLs are accepted.",
+                "description": "Read exact pages. Use first whenever the user supplies a URL; use after web_search when the answer needs source text. GitHub issue/PR, StackOverflow (StackExchange), arXiv, and Wikipedia URLs are parsed into structured Markdown; other pages go through Tavily Extract, then Exa, TinyFish, Firecrawl (first that returns content). Pass `url` for one page or `urls` (up to 20) for several; with several, all non-specialist URLs go to Tavily in one call and any it cannot read fall back one by one, with Tavily's reason kept in `failed`. Tavily options (query, chunks_per_source, include_images, include_favicon, timeout, include_usage) are ignored by specialists and other providers. Returns content with provenance: provider, content_hash (SHA-256 of the returned content), extracted_at, and source_log. Only http(s) URLs are accepted.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -402,9 +545,15 @@ fn tools_list() -> Value {
                             "type": "array",
                             "items": { "type": "string" },
                             "minItems": 1,
-                            "maxItems": 10,
+                            "maxItems": 20,
                             "description": "Several URLs to read; failures are listed in `failed` instead of failing the call. Takes precedence over `url`."
                         },
+                        "query": { "type": "string", "description": "Tavily only. Return the passages of each page most relevant to this intent instead of the whole page. Leave unset for tables, lists and data files." },
+                        "chunks_per_source": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Tavily only, with query. Passages per page (default 3)." },
+                        "include_images": { "type": "boolean", "description": "Tavily only. Image URLs per page in `images`." },
+                        "include_favicon": { "type": "boolean", "description": "Tavily only. `favicon` per page." },
+                        "timeout": { "type": "number", "minimum": 1, "maximum": 60, "description": "Tavily only. Seconds Tavily may spend per extraction (default 10 basic / 30 advanced)." },
+                        "include_usage": { "type": "boolean", "description": "Tavily only. Credit usage in `usage`." },
                         "depth": {
                             "type": "string",
                             "enum": ["basic", "advanced"],
@@ -418,20 +567,58 @@ fn tools_list() -> Value {
                         "max_chars": {
                             "type": "integer",
                             "minimum": 1,
-                            "description": "Character cap. With `url`: per page, default GROK_SEARCH_FETCH_MAX_CHARS (unlimited if unset). With `urls`: one budget shared by all pages in order, default GROK_SEARCH_RESPONSE_MAX_CHARS."
+                            "description": "Character cap. With `url`: per page, default LLM_SEARCH_FETCH_MAX_CHARS (unlimited if unset). With `urls`: one budget shared by all pages in order, default LLM_SEARCH_RESPONSE_MAX_CHARS."
                         }
                     }
                 }
             },
             {
                 "name": "web_map",
-                "description": "Map/discover URLs through Tavily Map.",
+                "description": "List a site's URLs through Tavily Map, starting from `url` and following links like a tree. Use when you know the site but not the page, then web_fetch the URLs you need. Steer it with `instructions` (natural language; doubles the credit cost) or regex `select_paths` / `select_domains` / `exclude_paths` / `exclude_domains`. Unset options keep Tavily's defaults (depth 1, breadth 20, limit 50). Cost: 1 credit per 10 URLs (2 with instructions).",
                 "inputSchema": {
                     "type": "object",
                     "required": ["url"],
                     "properties": {
-                        "url": { "type": "string" },
-                        "max_results": { "type": "integer", "minimum": 1 }
+                        "url": { "type": "string", "description": "Root URL to map from." },
+                        "instructions": { "type": "string", "description": "What pages to return, e.g. \"pages about the Python SDK\"." },
+                        "max_depth": { "type": "integer", "minimum": 1, "maximum": 5, "description": "How many link levels from url (default 1)." },
+                        "max_breadth": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Links followed per page (default 20)." },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Total links processed before stopping (default 50)." },
+                        "max_results": { "type": "integer", "minimum": 1, "description": "Alias of limit (kept for compatibility)." },
+                        "select_paths": { "type": "array", "items": { "type": "string" }, "description": "Regexes; keep only URL paths matching one (e.g. /docs/.*)." },
+                        "select_domains": { "type": "array", "items": { "type": "string" }, "description": "Regexes; keep only these (sub)domains (e.g. ^docs\\.example\\.com$)." },
+                        "exclude_paths": { "type": "array", "items": { "type": "string" }, "description": "Regexes; drop URL paths matching one." },
+                        "exclude_domains": { "type": "array", "items": { "type": "string" }, "description": "Regexes; drop these (sub)domains." },
+                        "allow_external": { "type": "boolean", "description": "Include links to other domains (default true)." },
+                        "timeout": { "type": "number", "minimum": 10, "maximum": 150, "description": "Seconds Tavily may spend (default 150)." },
+                        "include_usage": { "type": "boolean", "description": "Credit usage in `usage`." }
+                    }
+                }
+            },
+            {
+                "name": "web_crawl",
+                "description": "Read many pages of one site through Tavily Crawl: starts at `url`, follows links like web_map, and extracts each page. Use for a whole docs section or site area; for a few known URLs use web_fetch, for URLs only use web_map. Local server: pages are written to one Markdown file and the result gives `file_path` plus an index with each page's `line`, so read only the parts you need with your file tool. Remote (HTTP) server: pages come back in `sources`, trimmed to the response budget; page the rest with get_sources(session_id). Steer with `instructions` or regex path/domain filters; keep `limit` small. Cost: map cost plus 1 credit per 5 pages (2 with extract_depth advanced). Needs a Tavily key.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["url"],
+                    "properties": {
+                        "url": { "type": "string", "description": "Root URL to crawl from." },
+                        "instructions": { "type": "string", "description": "Which pages to return, in natural language (doubles the mapping cost)." },
+                        "chunks_per_source": { "type": "integer", "minimum": 1, "maximum": 5, "description": "With instructions: relevant passages per page instead of the whole page (default 3)." },
+                        "max_depth": { "type": "integer", "minimum": 1, "maximum": 5, "description": "Link levels from url (default 1)." },
+                        "max_breadth": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Links followed per page (default 20)." },
+                        "limit": { "type": "integer", "minimum": 1, "description": "Total links processed before stopping (default 50)." },
+                        "select_paths": { "type": "array", "items": { "type": "string" }, "description": "Regexes; crawl only URL paths matching one (e.g. /docs/.*)." },
+                        "select_domains": { "type": "array", "items": { "type": "string" }, "description": "Regexes; crawl only these (sub)domains." },
+                        "exclude_paths": { "type": "array", "items": { "type": "string" }, "description": "Regexes; skip URL paths matching one." },
+                        "exclude_domains": { "type": "array", "items": { "type": "string" }, "description": "Regexes; skip these (sub)domains." },
+                        "allow_external": { "type": "boolean", "description": "Include links to other domains (default true)." },
+                        "include_images": { "type": "boolean", "description": "Image URLs per page." },
+                        "extract_depth": { "type": "string", "enum": ["basic", "advanced"], "description": "advanced handles tables and embedded content at twice the extraction cost." },
+                        "format": { "type": "string", "enum": ["markdown", "text"], "description": "Page text format (default markdown)." },
+                        "include_favicon": { "type": "boolean", "description": "favicon per page." },
+                        "timeout": { "type": "number", "minimum": 10, "maximum": 150, "description": "Seconds Tavily may spend (default 150)." },
+                        "include_usage": { "type": "boolean", "description": "Credit usage in `usage`." }
                     }
                 }
             },
@@ -493,7 +680,11 @@ fn parse_fetch_options(args: &Value) -> Result<FetchOptions> {
             )))
         }
     };
-    Ok(FetchOptions { depth, format })
+    Ok(FetchOptions {
+        depth,
+        format,
+        tavily: crate::tool_params::parse_extract_extras(args)?,
+    })
 }
 
 /// Only HTTP(S) URLs are fetched.
@@ -610,6 +801,42 @@ mod tests {
         // An existing stdio client must still see its own requested revision.
         assert_eq!(response["result"]["protocolVersion"], "2024-11-05");
         assert_eq!(response["result"]["serverInfo"]["name"], "llm-search");
+    }
+
+    #[tokio::test]
+    async fn initialize_returns_server_instructions() {
+        let service = SearchService::fake_with_sources();
+        let response = handle_request(
+            &service,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "initialize",
+                "params": { "protocolVersion": "2025-11-25", "capabilities": {} }
+            }),
+        )
+        .await
+        .expect("initialize response");
+        assert_eq!(response["result"]["instructions"], SERVER_INSTRUCTIONS);
+    }
+
+    #[test]
+    fn instructions_fit_client_budget_and_name_every_tool() {
+        // Claude Code cuts server instructions at 4,096 UTF-16 code units
+        // (2,048 in older releases); anything past that is silently lost.
+        let units = SERVER_INSTRUCTIONS.encode_utf16().count();
+        assert!(units <= 2048, "instructions are {units} UTF-16 units");
+        assert!(SERVER_INSTRUCTIONS.is_ascii());
+        // A renamed or added tool must not leave the guide pointing at a
+        // tool that no longer exists, or silent about a new one.
+        let tools = tools_list();
+        for tool in tools["tools"].as_array().expect("tools array") {
+            let name = tool["name"].as_str().expect("tool name");
+            assert!(
+                SERVER_INSTRUCTIONS.contains(name),
+                "instructions do not mention tool {name}"
+            );
+        }
     }
 
     #[tokio::test]

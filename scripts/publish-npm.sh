@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Publish @keon981/llm-search to npm from this machine with `vp pm publish`.
+# Publish the llm-search npm packages from this machine with `vp pm publish`.
 #
 # The binaries come from the GitHub Release that release.yml builds for the
 # tag, so no Rust toolchain or cross-compilation is needed here.
@@ -7,16 +7,23 @@
 #   scripts/publish-npm.sh 0.2.0            # publish
 #   scripts/publish-npm.sh 0.2.0 --dry-run  # pack and preview only
 #
-# Requires: curl, tar, unzip, node, vp, and `vp pm login` done beforehand.
+# Requires: git, curl, tar, unzip, node, vp, and `vp pm login` done beforehand.
 set -euo pipefail
 
 VERSION="${1:?usage: scripts/publish-npm.sh <version> [--dry-run]}"
 VERSION="${VERSION#v}"
 DRY_RUN="${2:-}"
-REPO="keon981/llm-search"
-BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
 
 cd "$(dirname "$0")/.."
+
+# The GitHub repo comes from the origin remote and every package name from its
+# package.json, so nothing here is tied to one account.
+REPO="$(git remote get-url origin | sed -E 's#^.*github\.com[:/]##; s#\.git$##')"
+[[ "$REPO" =~ ^[^/:@]+/[^/:@]+$ ]] || { echo "origin remote is not a GitHub repository" >&2; exit 1; }
+BASE="https://github.com/${REPO}/releases/download/v${VERSION}"
+
+pkg_name() { node -p "require('./$1/package.json').name"; }
+MAIN_PKG="$(pkg_name npm/llm-search)"
 
 # platform dir | release asset | binary name
 PLATFORMS=(
@@ -80,6 +87,7 @@ publish() {
 for entry in "${PLATFORMS[@]}"; do
   IFS='|' read -r platform asset binary <<<"$entry"
   dir="npm/platforms/${platform}"
+  name="$(pkg_name "$dir")"
   rm -rf "${dir}/bin" && mkdir -p "${dir}/bin"
   if [[ "$asset" == *.zip ]]; then
     unzip -q "$WORK/${asset}" -d "${dir}/bin"
@@ -87,7 +95,7 @@ for entry in "${PLATFORMS[@]}"; do
     tar -xzf "$WORK/${asset}" -C "${dir}/bin"
   fi
   [[ "$binary" == *.exe ]] || chmod +x "${dir}/bin/${binary}"
-  if [ "$DRY_RUN" != "--dry-run" ] && vp pm view "@keon981/llm-search-${platform}@${VERSION}" version >/dev/null 2>&1; then
+  if [ "$DRY_RUN" != "--dry-run" ] && vp pm view "${name}@${VERSION}" version >/dev/null 2>&1; then
     echo "Skip ${platform}: ${VERSION} already published"
     continue
   fi
@@ -95,12 +103,16 @@ for entry in "${PLATFORMS[@]}"; do
   publish "$dir"
 done
 
-echo "Publishing main package"
-publish npm/llm-search
+if [ "$DRY_RUN" != "--dry-run" ] && vp pm view "${MAIN_PKG}@${VERSION}" version >/dev/null 2>&1; then
+  echo "Skip main package: ${VERSION} already published"
+else
+  echo "Publishing main package"
+  publish npm/llm-search
+fi
 
 # Keep the extracted binaries out of git.
 for entry in "${PLATFORMS[@]}"; do
   IFS='|' read -r platform _ _ <<<"$entry"
   rm -rf "npm/platforms/${platform}/bin"
 done
-echo "Done: @keon981/llm-search@${VERSION}"
+echo "Done: ${MAIN_PKG}@${VERSION}"

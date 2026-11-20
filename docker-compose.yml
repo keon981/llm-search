@@ -14,7 +14,7 @@ services:
     image: grok-search-rs:latest
     restart: unless-stopped
     environment:
-      GROK_MCP_BIND: "0.0.0.0:8080"
+      LLM_SEARCH_BIND: "0.0.0.0:8080"
       # Operator NON-secret defaults only (e.g. a fixed Grok-compatible gateway):
       #   GROK_SEARCH_URL: "https://api.x.ai/v1"
       # NEVER put *_API_KEY here — credentials come from per-request headers, and

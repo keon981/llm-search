@@ -71,6 +71,7 @@ fn spawn_mock_server(responses: Vec<(u16, &'static str)>) -> (String, Arc<Mutex<
             let reason = match status {
                 200 => "OK",
                 429 => "Too Many Requests",
+                404 => "Not Found",
                 432 => "Plan Limit Exceeded",
                 500 => "Internal Server Error",
                 _ => "Mock",
@@ -195,4 +196,58 @@ async fn single_key_exhausts_without_retry() {
         .expect_err("single key has nothing to rotate to");
 
     assert_eq!(auth_log.lock().expect("auth log lock").len(), 1);
+}
+
+// Tavily scopes a research task to the key that queued it. Plain rotation
+// would poll with the next key and get a 404 for a task that exists.
+#[tokio::test]
+async fn research_polls_with_the_key_that_queued_the_task() {
+    let (base, auth_log) = spawn_mock_server(vec![
+        (200, r#"{"request_id":"res-1","status":"pending"}"#),
+        (200, r#"{"request_id":"res-1","status":"in_progress"}"#),
+        (
+            200,
+            r#"{"request_id":"res-1","status":"completed","content":"done"}"#,
+        ),
+    ]);
+    let provider = provider_for(&base, "key-a,key-b");
+
+    provider
+        .research_start(&serde_json::json!({ "input": "topic" }))
+        .await
+        .expect("start");
+    provider.research_get("res-1").await.expect("poll 1");
+    let done = provider.research_get("res-1").await.expect("poll 2");
+    assert_eq!(done["status"], "completed");
+
+    let log = auth_log.lock().expect("auth log lock").clone();
+    assert_eq!(log.len(), 3);
+    assert!(
+        log.iter().all(|auth| auth == &log[0]),
+        "keys changed: {log:?}"
+    );
+}
+
+// Resuming a task this process did not start: try each key until one knows it.
+#[tokio::test]
+async fn research_resume_tries_each_key_on_404() {
+    let (base, auth_log) = spawn_mock_server(vec![
+        (404, r#"{"detail":"not found"}"#),
+        (
+            200,
+            r#"{"request_id":"res-9","status":"completed","content":"done"}"#,
+        ),
+    ]);
+    let provider = provider_for(&base, "key-a,key-b");
+
+    let done = provider
+        .research_get("res-9")
+        .await
+        .expect("second key knows the task");
+    assert_eq!(done["content"], "done");
+    let log = auth_log.lock().expect("auth log lock").clone();
+    assert_eq!(
+        log,
+        vec!["Bearer key-a".to_string(), "Bearer key-b".to_string()]
+    );
 }

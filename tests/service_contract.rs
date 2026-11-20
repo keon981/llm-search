@@ -1174,7 +1174,7 @@ async fn web_fetch_truncates_via_env_default() {
         None,
         Arc::new(LongFetchSourceProvider),
         None,
-        [("GROK_SEARCH_FETCH_MAX_CHARS", "5")],
+        [("LLM_SEARCH_FETCH_MAX_CHARS", "5")],
     );
 
     let output = service

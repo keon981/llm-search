@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::model::search::SearchHints;
 use crate::model::source::Source;
 use crate::sources::SourceType;
 
@@ -23,9 +24,32 @@ pub struct WebSearchInput {
     /// `"deep"`, or `"verify"`. Ignored, with a warning, in Grok mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Router mode only: results to return, clamped to 1..=10 (default 5).
+    /// Router mode only: results to return, clamped to 1..=20 (default 5).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_results: Option<usize>,
+    /// Relative publish window (`day` / `week` / `month` / `year`). Strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_range: Option<String>,
+    /// Absolute publish window bounds, `YYYY-MM-DD`. Strict.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_date: Option<String>,
+    /// Cross-provider ranking hints (country, language, safe_search, exact_match).
+    #[serde(default, skip_serializing_if = "SearchHints::is_empty")]
+    pub hints: SearchHints,
+    /// Tavily-only search fields under their Tavily names, validated by the
+    /// tool layer; applied only when Tavily serves.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub tavily: serde_json::Map<String, serde_json::Value>,
+    /// `mode=research` fields under Tavily research names (`model`,
+    /// `output_schema`, `citation_format`, `output_length`), validated by the
+    /// tool layer.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub research: serde_json::Map<String, serde_json::Value>,
+    /// Resume waiting on an earlier research task instead of starting one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_id: Option<String>,
 }
 
 /// One provider that was tried and did not serve the result.
@@ -61,7 +85,7 @@ pub struct SourceLogEntry {
     pub status: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WebSearchOutput {
     pub session_id: String,
     pub content: String,
@@ -92,6 +116,25 @@ pub struct WebSearchOutput {
     /// Non-fatal problems with the request (an ignored parameter, …).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
+    /// Provider request id (Tavily), when the serving provider returned one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Provider credit usage (Tavily `include_usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+    /// Query-level images (Tavily `include_images`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<serde_json::Value>,
+    /// `mode=research`: the Tavily research task id (pass it back as
+    /// `research_id` to keep waiting).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub research_id: Option<String>,
+    /// `mode=research`: Tavily's task status (`completed`, or still running).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// `mode=research`: seconds this call waited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +153,21 @@ pub struct GetSourcesOutput {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Optional page metadata a provider returned (Tavily extract): flattened into
+/// `WebFetchOutput`, every field absent from JSON unless set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct FetchExtras {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WebFetchOutput {
     pub url: String,
     pub content: String,
@@ -138,6 +195,45 @@ pub struct WebFetchOutput {
     /// One provenance record for this page.
     #[serde(default)]
     pub source_log: Vec<SourceLogEntry>,
+    #[serde(flatten)]
+    pub extras: FetchExtras,
+}
+
+/// One crawled page in the `web_crawl` index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CrawlPageIndex {
+    pub url: String,
+    /// Characters of extracted text.
+    pub chars: usize,
+    /// 1-based line where the page's section starts in `file_path`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+}
+
+/// `web_crawl` result. On a local (stdio) server the pages are written to
+/// `file_path` and only the index comes back; on the HTTP transport they come
+/// back in `sources`, trimmed to the response budget, with the full set under
+/// `session_id` for `get_sources`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WebCrawlOutput {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    pub pages_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_path: Option<String>,
+    pub pages: Vec<CrawlPageIndex>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sources: Vec<Source>,
+    pub truncated: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<FetchFailure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
 }
 
 /// One URL of a multi-URL `web_fetch` that produced no content.
@@ -149,7 +245,7 @@ pub struct FetchFailure {
 
 /// Multi-URL `web_fetch` (`urls` argument). `max_chars` is a budget shared by
 /// all results, spent in input order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct WebFetchBatchOutput {
     pub results: Vec<WebFetchOutput>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -158,6 +254,12 @@ pub struct WebFetchBatchOutput {
     pub source_log: Vec<SourceLogEntry>,
     /// True when the shared budget cut any result.
     pub truncated: bool,
+    /// Tavily batch extract request id(s), when the batch went to Tavily.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub request_ids: Vec<String>,
+    /// Tavily credit usage of the batch call(s) (`include_usage`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<serde_json::Value>,
 }
 
 #[cfg(test)]
@@ -179,6 +281,7 @@ mod tests {
             content_hash: String::new(),
             extracted_at: String::new(),
             source_log: Vec::new(),
+            ..WebFetchOutput::default()
         };
         let value = serde_json::to_value(&output).unwrap();
         assert_eq!(value["source_type"], "generic");
@@ -199,6 +302,7 @@ mod tests {
             content_hash: String::new(),
             extracted_at: String::new(),
             source_log: Vec::new(),
+            ..WebFetchOutput::default()
         };
         let value = serde_json::to_value(&output).unwrap();
         assert_eq!(value["fallback_reason"], "github_issue empty render");

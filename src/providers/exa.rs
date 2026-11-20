@@ -112,10 +112,16 @@ pub fn exa_search_request_body(
     if !filters.exclude_domains.is_empty() {
         object.insert("excludeDomains".into(), json!(filters.exclude_domains));
     }
-    if let Some(days) = filters.recency_days {
+    if let Some(day) = filters.start_day(now_unix) {
         object.insert(
             "startPublishedDate".into(),
-            json!(start_published_date(days, now_unix)),
+            json!(format!("{}T00:00:00.000Z", crate::clock::ymd_from_day(day))),
+        );
+    }
+    if let Some(day) = filters.end_day() {
+        object.insert(
+            "endPublishedDate".into(),
+            json!(format!("{}T23:59:59.999Z", crate::clock::ymd_from_day(day))),
         );
     }
     body
@@ -201,6 +207,7 @@ pub fn parse_exa_contents(raw: &Value, url: &str) -> Result<FetchedPage> {
                     .get("publishedDate")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                ..FetchedPage::default()
             });
         }
     }

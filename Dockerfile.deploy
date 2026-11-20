@@ -13,7 +13,7 @@ RUN apk add --no-cache ca-certificates \
 # BuildKit sets TARGETPLATFORM per output platform (linux/amd64, linux/arm64, ...).
 ARG TARGETPLATFORM
 COPY dist/${TARGETPLATFORM}/grok-search-rs /usr/local/bin/grok-search-rs
-ENV GROK_MCP_BIND=0.0.0.0:8080
+ENV LLM_SEARCH_BIND=0.0.0.0:8080
 EXPOSE 8080
 USER grokmcp
 ENTRYPOINT ["grok-search-rs", "--http"]

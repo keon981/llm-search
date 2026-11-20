@@ -14,6 +14,9 @@ pub struct Source {
     /// `Some` → non-empty string: structured markdown or a deterministic failure note.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Site icon URL (Tavily `include_favicon`); absent unless requested.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub favicon: Option<String>,
 }
 
 impl Source {
@@ -25,6 +28,7 @@ impl Source {
             description: None,
             published_date: None,
             content: None,
+            favicon: None,
         }
     }
 
@@ -48,11 +52,48 @@ impl Source {
 /// structured metadata the provider returned alongside it. Metadata fields are
 /// best-effort — `None` whenever the provider response lacks them (Tavily
 /// extract carries a title but no date; Firecrawl scrape carries both).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct FetchedPage {
     pub content: String,
     pub title: Option<String>,
     pub published_date: Option<String>,
+    /// Page images (Tavily `include_images`).
+    pub images: Vec<serde_json::Value>,
+    /// Site icon URL (Tavily `include_favicon`).
+    pub favicon: Option<String>,
+    /// Provider request id of the call that produced the page.
+    pub request_id: Option<String>,
+    /// Provider credit usage (Tavily `include_usage`).
+    pub usage: Option<serde_json::Value>,
+}
+
+/// Result of a site crawl (`web_crawl`): extracted pages in crawl order,
+/// pages that could not be read, and call metadata.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct CrawlResult {
+    pub base_url: Option<String>,
+    pub pages: Vec<(String, FetchedPage)>,
+    pub failed: Vec<(String, String)>,
+    pub request_id: Option<String>,
+    pub usage: Option<serde_json::Value>,
+}
+
+/// Result of a site map (`web_map`): discovered URLs plus call metadata.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MapResult {
+    pub sources: Vec<Source>,
+    pub base_url: Option<String>,
+    pub request_id: Option<String>,
+    pub usage: Option<serde_json::Value>,
+}
+
+/// Result of a provider-side batch fetch: one outcome per requested URL, in
+/// request order (`Err` carries the provider's reason), plus call metadata.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct BatchFetch {
+    pub outcomes: Vec<std::result::Result<FetchedPage, String>>,
+    pub request_ids: Vec<String>,
+    pub usage: Option<serde_json::Value>,
 }
 
 impl FetchedPage {
@@ -60,8 +101,7 @@ impl FetchedPage {
     pub fn text(content: impl Into<String>) -> Self {
         Self {
             content: content.into(),
-            title: None,
-            published_date: None,
+            ..Self::default()
         }
     }
 }

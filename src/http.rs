@@ -63,9 +63,9 @@ const SECRET_ENV_KEYS: &[&str] = &[
     "TINYFISH_API_KEY",
     "EXA_API_KEY",
     "GITHUB_TOKEN",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "OPENAI_COMPATIBLE_API_URL",
-    "OPENAI_COMPATIBLE_MODEL",
+    // Not a secret: stripped so the remote server keeps serving the Responses
+    // protocol only (chat completions is a stdio-only option).
+    "GROK_SEARCH_PROTOCOL",
     "GROK_SEARCH_AUTH_MODE",
     "GROK_SEARCH_AUTH_FILE",
 ];
@@ -113,7 +113,7 @@ struct AppState {
 pub async fn run_http(base_env: HashMap<String, String>, bind: SocketAddr) -> anyhow::Result<()> {
     // Operator (non-secret) config drives the shared client + cache sizing.
     let operator_cfg = Config::from_env_map(base_env.clone());
-    // Fail before binding on a bad GROK_SEARCH_SOURCE_PROVIDERS: the chain is
+    // Fail before binding on a bad LLM_SEARCH_SOURCE_PROVIDERS: the chain is
     // operator-fixed (never a request header), and deferring the error to
     // per-request service construction would leave a listener up that rejects
     // every call.
@@ -574,7 +574,10 @@ fn request_config(
     if let Some(url) = gateway {
         map.insert("GROK_SEARCH_URL".to_string(), url.to_string());
     }
-    Config::from_env_map(map)
+    let mut config = Config::from_env_map(map);
+    // The server's disk is not the caller's: web_crawl returns pages inline.
+    config.write_crawl_files = false;
+    config
 }
 
 /// The Grok gateway a request targets via `X-Grok-Base-Url`, honored verbatim
@@ -635,10 +638,10 @@ fn header_for_env(env_key: &str) -> Option<&'static str> {
         .map(|(header, _)| *header)
 }
 
-/// Parse `GROK_MCP_ALLOWED_ORIGINS` (comma-separated) into an allowlist.
+/// Parse `LLM_SEARCH_ALLOWED_ORIGINS` (comma-separated) into an allowlist.
 /// Unset/empty -> `None` (no browser-origin restriction; keys are per-request).
 fn parse_allowed_origins(env: &HashMap<String, String>) -> Option<HashSet<String>> {
-    let raw = env.get("GROK_MCP_ALLOWED_ORIGINS")?;
+    let raw = env.get("LLM_SEARCH_ALLOWED_ORIGINS")?;
     let set: HashSet<String> = raw
         .split(',')
         .map(str::trim)
@@ -715,6 +718,8 @@ mod tests {
         // Absent model header -> operator default survives.
         let default_cfg = request_config(&base(), &headers(&[]), None);
         assert_eq!(default_cfg.grok_model, "grok-4-1-fast-reasoning");
+        // The server's disk is not the caller's: crawl results stay inline.
+        assert!(!cfg.write_crawl_files);
     }
 
     #[test]
@@ -764,7 +769,7 @@ mod tests {
         for key in SECRET_ENV_KEYS {
             env.insert((*key).to_string(), "secret".to_string());
         }
-        env.insert("GROK_SEARCH_TIMEOUT_SECONDS".to_string(), "30".to_string());
+        env.insert("LLM_SEARCH_TIMEOUT_SECONDS".to_string(), "30".to_string());
         let stripped = strip_secrets(env);
         for key in SECRET_ENV_KEYS {
             assert!(!stripped.contains_key(*key), "{key} not stripped");
@@ -772,7 +777,7 @@ mod tests {
         // Non-secret operator knobs survive.
         assert_eq!(
             stripped
-                .get("GROK_SEARCH_TIMEOUT_SECONDS")
+                .get("LLM_SEARCH_TIMEOUT_SECONDS")
                 .map(String::as_str),
             Some("30")
         );
@@ -783,7 +788,7 @@ mod tests {
         assert!(parse_allowed_origins(&base()).is_none());
         let mut env = HashMap::new();
         env.insert(
-            "GROK_MCP_ALLOWED_ORIGINS".to_string(),
+            "LLM_SEARCH_ALLOWED_ORIGINS".to_string(),
             "https://a.example, https://b.example".to_string(),
         );
         let set = parse_allowed_origins(&env).expect("allowlist");

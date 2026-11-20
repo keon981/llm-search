@@ -1,4 +1,5 @@
-//! End-to-end probe for the OpenAI-compatible transport. Skipped by default
+//! End-to-end probe for the chat-completions protocol
+//! (`GROK_SEARCH_PROTOCOL=chat_completions`). Skipped by default
 //! because it hits live HTTP — run with:
 //!
 //!   GROK_SEARCH_E2E_CHAT_URL=https://your-gateway/v1\

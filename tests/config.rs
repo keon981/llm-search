@@ -38,11 +38,10 @@ fn unknown_auth_mode_falls_back_to_api_key() {
 }
 
 #[test]
-fn oauth_transport_wins_over_openai_compatible_config() {
+fn oauth_transport_wins_over_chat_completions_protocol() {
     let cfg = Config::from_env_map([
         ("GROK_SEARCH_AUTH_MODE", "oauth"),
-        ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
-        ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
+        ("GROK_SEARCH_PROTOCOL", "chat_completions"),
     ]);
 
     assert_eq!(cfg.grok_auth_mode, AuthMode::OAuth);
@@ -190,7 +189,7 @@ fn config_reads_extra_sources_and_fallback_sources_from_env() {
 fn config_reads_timeout_seconds() {
     let cfg = Config::from_env_map([
         ("GROK_SEARCH_API_KEY", "grok-test-key"),
-        ("GROK_SEARCH_TIMEOUT_SECONDS", "90"),
+        ("LLM_SEARCH_TIMEOUT_SECONDS", "90"),
     ]);
 
     assert_eq!(cfg.timeout.as_secs(), 90);
@@ -225,7 +224,7 @@ timeout_seconds = 42
     )
     .unwrap();
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-from-file"));
     assert_eq!(cfg.grok_model, "grok-5-test");
@@ -248,7 +247,7 @@ default_extra_sources = 7
     .unwrap();
 
     let cfg = Config::load_from([
-        ("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string()),
+        ("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string()),
         ("GROK_SEARCH_API_KEY", "grok-env-key".into()),
         ("GROK_SEARCH_MODEL", "model-from-env".into()),
         ("GROK_SEARCH_EXTRA_SOURCES", "2".into()),
@@ -266,7 +265,7 @@ fn missing_config_file_falls_back_to_env_and_defaults() {
 
     let cfg = Config::load_from([
         (
-            "GROK_SEARCH_CONFIG",
+            "LLM_SEARCH_CONFIG",
             nonexistent.to_string_lossy().to_string(),
         ),
         ("GROK_SEARCH_API_KEY", "grok-env-key".into()),
@@ -306,7 +305,7 @@ timeout_seconds       = 30
     )
     .unwrap();
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     assert_eq!(cfg.grok_api_url, "https://api.modelverse.cn/v1");
     assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-full"));
@@ -366,7 +365,7 @@ fn fresh_template_does_not_override_defaults_or_supply_credentials() {
     let path = dir.path().join("config.toml");
     config::write_template(&path).unwrap();
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     assert!(
         cfg.grok_api_key.is_none(),
@@ -397,7 +396,7 @@ fn config_path_honors_explicit_env_override() {
 #[test]
 fn config_path_explicit_override_wins_over_home() {
     let path = config::config_path_for([
-        ("GROK_SEARCH_CONFIG", "/tmp/custom/grok.toml"),
+        ("LLM_SEARCH_CONFIG", "/tmp/custom/grok.toml"),
         ("HOME", "/home/ignored"),
         ("USERPROFILE", "C:\\Users\\ignored"),
     ])
@@ -484,8 +483,8 @@ fn response_budget_defaults_and_env_overrides() {
     assert_eq!(defaults.response_max_chars, 45_000);
 
     let overridden = Config::from_env_map([
-        ("GROK_SEARCH_MAX_INLINE_SOURCES", "2"),
-        ("GROK_SEARCH_RESPONSE_MAX_CHARS", "30000"),
+        ("LLM_SEARCH_MAX_INLINE_SOURCES", "2"),
+        ("LLM_SEARCH_RESPONSE_MAX_CHARS", "30000"),
     ]);
     assert_eq!(overridden.max_inline_sources, 2);
     assert_eq!(overridden.response_max_chars, 30_000);
@@ -537,10 +536,45 @@ fn tinyfish_and_exa_read_keys_urls_and_toggles() {
 #[test]
 fn source_providers_csv_is_trimmed_lowercased_and_deduped() {
     let cfg = Config::from_env_map([(
-        "GROK_SEARCH_SOURCE_PROVIDERS",
+        "LLM_SEARCH_SOURCE_PROVIDERS",
         " Tavily, exa ,tavily,, TINYFISH ",
     )]);
     assert_eq!(cfg.source_providers, ["tavily", "exa", "tinyfish"]);
+}
+
+#[test]
+fn provider_lists_accept_comma_and_bracket_forms() {
+    let cfg = Config::from_env_map([
+        ("LLM_SEARCH_SOURCE_PROVIDERS", "[tavily, exa]"),
+        ("LLM_SEARCH_QUICK_ORDER", r#"["Tavily", 'brave']"#),
+        ("LLM_SEARCH_DEEP_ORDER", "brave,tavily"),
+    ]);
+    assert_eq!(cfg.source_providers, ["tavily", "exa"]);
+    assert_eq!(cfg.quick_order, ["tavily", "brave"]);
+    assert_eq!(cfg.deep_order, ["brave", "tavily"]);
+    // Unset means the default order.
+    let cfg = Config::from_env_map([("LLM_SEARCH_PROVIDER", "brave")]);
+    assert!(cfg.quick_order.is_empty() && cfg.deep_order.is_empty());
+}
+
+#[test]
+fn config_file_accepts_mode_orders() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"
+quick_order = ["tavily", "brave"]
+deep_order = ["exa"]
+"#,
+    )
+    .unwrap();
+
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+
+    assert_eq!(cfg.config_file_state, ConfigFileState::Loaded);
+    assert_eq!(cfg.quick_order, ["tavily", "brave"]);
+    assert_eq!(cfg.deep_order, ["exa"]);
 }
 
 #[test]
@@ -557,7 +591,7 @@ source_providers = ["tinyfish", "exa"]
     )
     .expect("write config");
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
     assert_eq!(cfg.tinyfish_api_key.as_deref(), Some("tf-file"));
     assert_eq!(cfg.exa_api_key.as_deref(), Some("exa-file"));
     assert_eq!(cfg.source_providers, ["tinyfish", "exa"]);
@@ -584,7 +618,7 @@ fn a_rejected_config_file_is_recorded_with_its_reason() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "grok_api_key = \"xai-typo\"\nnot_a_real_key = 1\n").unwrap();
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     // Strictness is deliberate and unchanged: one unknown key voids the whole
     // file rather than half-applying it. What changes is that the rejection is
@@ -607,7 +641,7 @@ fn an_absent_config_file_is_not_reported_as_a_failure() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("nothing-here.toml");
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     assert_eq!(cfg.config_file_state, ConfigFileState::Absent);
     assert_eq!(
@@ -623,7 +657,7 @@ fn a_good_config_file_is_recorded_as_loaded() {
     let path = dir.path().join("config.toml");
     fs::write(&path, "grok_api_key = \"xai-good\"\n").unwrap();
 
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_string_lossy().to_string())]);
 
     assert_eq!(cfg.config_file_state, ConfigFileState::Loaded);
     assert_eq!(cfg.grok_api_key.as_deref(), Some("xai-good"));
@@ -674,7 +708,7 @@ fn config_file_accepts_engine_and_brave_keys() {
         "llm_search_provider = \"grok\"\nbrave_api_key = \"file-brave-key\"\nbrave_enabled = false\n",
     )
     .unwrap();
-    let cfg = Config::load_from([("GROK_SEARCH_CONFIG", path.to_str().unwrap())]);
+    let cfg = Config::load_from([("LLM_SEARCH_CONFIG", path.to_str().unwrap())]);
     assert_eq!(cfg.config_file_state.as_str(), "loaded");
     assert_eq!(cfg.search_engine, llm_search::config::SearchEngine::Grok);
     assert_eq!(cfg.brave_api_key.as_deref(), Some("file-brave-key"));

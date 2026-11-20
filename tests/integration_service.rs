@@ -1,5 +1,5 @@
-//! End-to-end probe through the full `SearchService` for the OpenAI-compatible
-//! transport. Skipped by default — run with:
+//! End-to-end probe through the full `SearchService` for
+//! `GROK_SEARCH_PROTOCOL=chat_completions`. Skipped by default — run with:
 //!
 //!   GROK_SEARCH_E2E_CHAT_URL=https://api.modelverse.cn/v1 \
 //!   GROK_SEARCH_E2E_CHAT_KEY=... \
@@ -20,9 +20,10 @@ async fn full_service_web_search_via_chat_completions() {
 
     let config = Config::from_env_map([
         ("LLM_SEARCH_PROVIDER", "grok"),
-        ("OPENAI_COMPATIBLE_API_URL", url.as_str()),
-        ("OPENAI_COMPATIBLE_API_KEY", key.as_str()),
-        ("OPENAI_COMPATIBLE_MODEL", model.as_str()),
+        ("GROK_SEARCH_PROTOCOL", "chat_completions"),
+        ("GROK_SEARCH_URL", url.as_str()),
+        ("GROK_SEARCH_API_KEY", key.as_str()),
+        ("GROK_SEARCH_MODEL", model.as_str()),
         ("TAVILY_ENABLED", "false"),
         ("FIRECRAWL_ENABLED", "false"),
     ]);
@@ -42,6 +43,7 @@ async fn full_service_web_search_via_chat_completions() {
             response_format: None,
             mode: None,
             max_results: None,
+            ..WebSearchInput::default()
         })
         .await
         .expect("web_search");

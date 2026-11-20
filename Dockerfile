@@ -20,7 +20,7 @@ RUN apt-get update \
     && useradd --system --no-create-home --shell /usr/sbin/nologin grokmcp
 COPY --from=builder /grok-search-rs /usr/local/bin/grok-search-rs
 # Bind all interfaces inside the container; a reverse proxy terminates TLS.
-ENV GROK_MCP_BIND=0.0.0.0:8080
+ENV LLM_SEARCH_BIND=0.0.0.0:8080
 EXPOSE 8080
 USER grokmcp
 ENTRYPOINT ["grok-search-rs", "--http"]

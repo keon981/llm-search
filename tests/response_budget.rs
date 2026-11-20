@@ -49,7 +49,7 @@ fn total_inline_chars(sources: &[Source]) -> usize {
         .sum()
 }
 
-// Item 1: only the first GROK_SEARCH_MAX_INLINE_SOURCES merged sources get
+// Item 1: only the first LLM_SEARCH_MAX_INLINE_SOURCES merged sources get
 // inline content; the rest stay metadata-only (content key absent), bounding
 // the response even when Grok returns dozens of citations.
 #[tokio::test]
@@ -60,7 +60,7 @@ async fn inline_content_capped_to_max_inline_sources() {
         None,
         [
             ("GROK_SEARCH_EXTRA_SOURCES", "3"),
-            ("GROK_SEARCH_MAX_INLINE_SOURCES", "2"),
+            ("LLM_SEARCH_MAX_INLINE_SOURCES", "2"),
         ],
     );
 
@@ -94,8 +94,8 @@ async fn response_budget_trims_tail_and_cache_keeps_full_content() {
         None,
         [
             ("GROK_SEARCH_EXTRA_SOURCES", "3"),
-            ("GROK_SEARCH_MAX_INLINE_SOURCES", "10"),
-            ("GROK_SEARCH_RESPONSE_MAX_CHARS", "12000"),
+            ("LLM_SEARCH_MAX_INLINE_SOURCES", "10"),
+            ("LLM_SEARCH_RESPONSE_MAX_CHARS", "12000"),
         ],
     );
 
@@ -262,7 +262,7 @@ async fn budget_counts_metadata_and_drops_tail_sources() {
         None,
         [
             ("GROK_SEARCH_EXTRA_SOURCES", "9"),
-            ("GROK_SEARCH_RESPONSE_MAX_CHARS", "2000"),
+            ("LLM_SEARCH_RESPONSE_MAX_CHARS", "2000"),
         ],
     );
 

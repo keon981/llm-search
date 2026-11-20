@@ -90,6 +90,7 @@ pub fn parse_firecrawl_scrape(raw: &Value) -> Result<FetchedPage> {
         content,
         title,
         published_date,
+        ..FetchedPage::default()
     })
 }
 

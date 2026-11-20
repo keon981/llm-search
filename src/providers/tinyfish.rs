@@ -107,10 +107,18 @@ pub fn tinyfish_search_params(query: &str, filters: &SearchFilters) -> Vec<(&'st
     if !filters.exclude_domains.is_empty() {
         params.push(("exclude_domains", filters.exclude_domains.join(",")));
     }
+    // TinyFish only knows "within the last N minutes": every window form
+    // becomes its lower bound. An upper bound (`end_date`) cannot be honored,
+    // so the router skips TinyFish for those requests (supports_end_date).
     if let Some(days) = filters.recency_days {
         let minutes = u64::from(days)
             .saturating_mul(24 * 60)
             .clamp(1, MAX_RECENCY_MINUTES);
+        params.push(("recency_minutes", minutes.to_string()));
+    } else if let Some(start) = filters.start_day(crate::clock::now_unix_seconds()) {
+        let now_day = (crate::clock::now_unix_seconds() / 86_400) as i64;
+        let days = (now_day - start).max(1) as u64;
+        let minutes = days.saturating_mul(24 * 60).clamp(1, MAX_RECENCY_MINUTES);
         params.push(("recency_minutes", minutes.to_string()));
     }
     params
@@ -160,6 +168,7 @@ pub fn parse_tinyfish_fetch(raw: &Value, url: &str) -> Result<FetchedPage> {
                     .and_then(Value::as_str)
                     .map(str::to_string),
                 published_date: None,
+                ..FetchedPage::default()
             });
         }
     }

@@ -3,6 +3,9 @@
 // every async trait in the crate — upstream GrokSearch-rs code included. The
 // expansion is the macro's, not ours, so the lint is allowed crate-wide.
 #![allow(clippy::double_must_use)]
+// The MCP tool list is one large `serde_json::json!` literal; its nesting
+// depth exceeds the default macro recursion limit of 128.
+#![recursion_limit = "512"]
 
 pub mod adapters;
 pub mod cache;
@@ -20,3 +23,4 @@ pub mod providers;
 pub mod redact;
 pub mod service;
 pub mod sources;
+pub mod tool_params;

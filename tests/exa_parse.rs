@@ -10,6 +10,7 @@ fn search_body_carries_native_domain_and_date_filters() {
         recency_days: Some(30),
         include_domains: vec!["arxiv.org".to_string()],
         exclude_domains: vec!["reddit.com".to_string()],
+        ..SearchFilters::default()
     };
     // 2026-08-02T00:00:00Z = 1785628800; 30 days earlier is 2026-07-03.
     let body = exa_search_request_body("LLM eval papers", 5, &filters, 1_785_628_800);
@@ -112,4 +113,16 @@ fn contents_failure_surfaces_status_reason() {
         message.contains("CRAWL_NOT_FOUND") && message.contains("https://gone.example"),
         "error must carry the upstream reason and url: {message}"
     );
+}
+
+#[test]
+fn exa_body_maps_absolute_window_bounds() {
+    let filters = SearchFilters {
+        start_date: Some("2026-01-01".to_string()),
+        end_date: Some("2026-01-31".to_string()),
+        ..SearchFilters::default()
+    };
+    let body = exa_search_request_body("q", 5, &filters, 0);
+    assert_eq!(body["startPublishedDate"], "2026-01-01T00:00:00.000Z");
+    assert_eq!(body["endPublishedDate"], "2026-01-31T23:59:59.999Z");
 }

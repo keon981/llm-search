@@ -19,8 +19,9 @@ use serde_json::Value;
 
 use crate::clock::{now_unix_seconds, utc_date};
 use crate::error::Result;
-use crate::model::search::SearchFilters;
+use crate::model::search::{SearchFilters, SearchHints, TimeRange};
 use crate::model::source::Source;
+use crate::providers::country::brave_country;
 
 use super::http::{build_client, get_json_with_header_auth};
 
@@ -61,7 +62,21 @@ impl BraveProvider {
         max_results: usize,
         filters: &SearchFilters,
     ) -> Result<Vec<Source>> {
-        let params = brave_search_params(query, max_results, filters, now_unix_seconds());
+        self.search_with_hints(query, max_results, filters, &SearchHints::default())
+            .await
+    }
+
+    /// [`search`](Self::search) with the shared ranking hints mapped onto
+    /// Brave's `country`, `search_lang` and `safesearch`.
+    pub async fn search_with_hints(
+        &self,
+        query: &str,
+        max_results: usize,
+        filters: &SearchFilters,
+        hints: &SearchHints,
+    ) -> Result<Vec<Source>> {
+        let params =
+            brave_search_params_with(query, max_results, filters, hints, now_unix_seconds());
         let raw = get_json_with_header_auth(
             &self.client,
             &format!("{}/res/v1/web/search", self.api_url),
@@ -76,11 +91,33 @@ impl BraveProvider {
     }
 }
 
-/// Query parameters for `GET /res/v1/web/search`.
+/// Query parameters for `GET /res/v1/web/search` with no ranking hints.
 pub fn brave_search_params(
     query: &str,
     max_results: usize,
     filters: &SearchFilters,
+    now_unix: u64,
+) -> Vec<(&'static str, String)> {
+    brave_search_params_with(
+        query,
+        max_results,
+        filters,
+        &SearchHints::default(),
+        now_unix,
+    )
+}
+
+/// Query parameters for `GET /res/v1/web/search`. Hints: `country` becomes an
+/// ISO alpha-2 code, `language` is forwarded as `search_lang` unchanged, and
+/// `safe_search` maps to `strict` / `off` (unset keeps Brave's `moderate`).
+/// `exact_match` needs no parameter: quoted phrases in `q` already match
+/// exactly on Brave. A value Brave rejects fails the request, and the router
+/// falls back to the next provider.
+pub fn brave_search_params_with(
+    query: &str,
+    max_results: usize,
+    filters: &SearchFilters,
+    hints: &SearchHints,
     now_unix: u64,
 ) -> Vec<(&'static str, String)> {
     let mut q = query.trim().to_string();
@@ -108,10 +145,52 @@ pub fn brave_search_params(
         ("text_decorations", "false".to_string()),
         ("result_filter", "web".to_string()),
     ];
-    if let Some(days) = filters.recency_days {
-        params.push(("freshness", brave_freshness(days, now_unix)));
+    if let Some(freshness) = brave_window(filters, now_unix) {
+        params.push(("freshness", freshness));
+    }
+    if let Some(code) = hints.country.as_deref().and_then(brave_country) {
+        params.push(("country", code));
+    }
+    if let Some(language) = &hints.language {
+        params.push(("search_lang", language.clone()));
+    }
+    if let Some(safe) = hints.safe_search {
+        params.push((
+            "safesearch",
+            if safe { "strict" } else { "off" }.to_string(),
+        ));
     }
     params
+}
+
+/// The publish-date window as a Brave `freshness` value.
+pub fn brave_window(filters: &SearchFilters, now_unix: u64) -> Option<String> {
+    if let Some(days) = filters.recency_days {
+        return Some(brave_freshness(days, now_unix));
+    }
+    if let Some(range) = filters.time_range {
+        return Some(
+            match range {
+                TimeRange::Day => "pd",
+                TimeRange::Week => "pw",
+                TimeRange::Month => "pm",
+                TimeRange::Year => "py",
+            }
+            .to_string(),
+        );
+    }
+    if filters.start_date.is_none() && filters.end_date.is_none() {
+        return None;
+    }
+    let start = filters
+        .start_date
+        .clone()
+        .unwrap_or_else(|| "1970-01-01".to_string());
+    let end = filters
+        .end_date
+        .clone()
+        .unwrap_or_else(|| utc_date(now_unix, 0));
+    Some(format!("{start}to{end}"))
 }
 
 /// `recency_days` → Brave `freshness`. Shortcut values only when the window
@@ -248,6 +327,47 @@ mod tests {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Requirement: a call with no new parameters sends exactly today's query.
+    #[test]
+    fn default_params_are_pinned() {
+        let params = brave_search_params("rust mcp", 5, &SearchFilters::default(), NOW);
+        assert_eq!(
+            params,
+            vec![
+                ("q", "rust mcp".to_string()),
+                ("count", "5".to_string()),
+                ("text_decorations", "false".to_string()),
+                ("result_filter", "web".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn hints_and_windows_map_onto_brave_params() {
+        let hints = SearchHints {
+            country: Some("taiwan".into()),
+            language: Some("zh-hant".into()),
+            safe_search: Some(true),
+            exact_match: Some(true),
+        };
+        let filters = SearchFilters {
+            time_range: Some(TimeRange::Month),
+            ..SearchFilters::default()
+        };
+        let params = brave_search_params_with("q", 5, &filters, &hints, NOW);
+        assert_eq!(param(&params, "freshness"), Some("pm"));
+        assert_eq!(param(&params, "country"), Some("TW"));
+        assert_eq!(param(&params, "search_lang"), Some("zh-hant"));
+        assert_eq!(param(&params, "safesearch"), Some("strict"));
+
+        let dates = SearchFilters {
+            start_date: Some("2026-01-01".into()),
+            ..SearchFilters::default()
+        };
+        let params = brave_search_params("q", 5, &dates, NOW);
+        assert_eq!(param(&params, "freshness"), Some("2026-01-01to2026-11-03"));
+    }
+
     #[test]
     fn params_clamp_count_and_disable_decorations() {
         let params = brave_search_params("rust mcp", 50, &SearchFilters::default(), NOW);
@@ -266,6 +386,7 @@ mod tests {
             recency_days: None,
             include_domains: vec!["https://www.Docs.rs/path".to_string()],
             exclude_domains: vec!["example.com".to_string(), "spam.net".to_string()],
+            ..SearchFilters::default()
         };
         let params = brave_search_params("tokio", 5, &filters, NOW);
         assert_eq!(

@@ -68,14 +68,31 @@ pub struct Config {
     /// Explicit source-provider chain order (lowercased names). Empty means
     /// "use the built-in canonical order over whatever is configured".
     pub source_providers: Vec<String>,
+    /// `web_search` `mode=quick` provider order (`LLM_SEARCH_QUICK_ORDER`).
+    /// Listed providers go first in this order, unlisted ones follow in the
+    /// default order. Empty = default (Brave, Tavily, then the chain).
+    pub quick_order: Vec<String>,
+    /// `web_search` `mode=deep` provider order (`LLM_SEARCH_DEEP_ORDER`), same
+    /// rules. Empty = default (Tavily, Brave, then the chain).
+    pub deep_order: Vec<String>,
     pub default_extra_sources: usize,
     pub fallback_sources: usize,
     pub fetch_max_chars: Option<usize>,
     pub cache_size: usize,
     pub timeout: Duration,
-    pub openai_compatible_api_url: Option<String>,
-    pub openai_compatible_api_key: Option<String>,
-    pub openai_compatible_model: Option<String>,
+    /// Where `web_crawl` writes its result files (`LLM_SEARCH_OUTPUT_DIR`);
+    /// `None` means `<OS temp>/llm-search`.
+    pub output_dir: Option<PathBuf>,
+    /// Whether `web_crawl` writes a file (local stdio server) or returns pages
+    /// inline. Not configurable: the HTTP transport turns it off because the
+    /// server's disk is not the caller's.
+    pub write_crawl_files: bool,
+    /// Override of the research wait limit
+    /// (`LLM_SEARCH_RESEARCH_MAX_WAIT_SECONDS`); `None` keeps the per-model
+    /// defaults (mini 300 s, pro/auto 900 s).
+    pub research_max_wait: Option<Duration>,
+    /// API format the Grok engine speaks to `GROK_SEARCH_URL`
+    /// (`GROK_SEARCH_PROTOCOL`): `responses` (default) or `chat_completions`.
     pub transport: Transport,
     pub github_token: Option<String>,
     pub source_max_answers: usize,
@@ -166,17 +183,16 @@ impl std::fmt::Debug for Config {
             .field("exa_api_key", &mask(&self.exa_api_key))
             .field("exa_enabled", &self.exa_enabled)
             .field("source_providers", &self.source_providers)
+            .field("quick_order", &self.quick_order)
+            .field("deep_order", &self.deep_order)
             .field("default_extra_sources", &self.default_extra_sources)
             .field("fallback_sources", &self.fallback_sources)
             .field("fetch_max_chars", &self.fetch_max_chars)
             .field("cache_size", &self.cache_size)
             .field("timeout", &self.timeout)
-            .field("openai_compatible_api_url", &self.openai_compatible_api_url)
-            .field(
-                "openai_compatible_api_key",
-                &mask(&self.openai_compatible_api_key),
-            )
-            .field("openai_compatible_model", &self.openai_compatible_model)
+            .field("output_dir", &self.output_dir)
+            .field("write_crawl_files", &self.write_crawl_files)
+            .field("research_max_wait", &self.research_max_wait)
             .field("transport", &self.transport)
             .field("github_token", &mask(&self.github_token))
             .field("source_max_answers", &self.source_max_answers)
@@ -221,14 +237,16 @@ struct ConfigFile {
     exa_api_key: Option<String>,
     exa_enabled: Option<bool>,
     source_providers: Option<Vec<String>>,
+    quick_order: Option<Vec<String>>,
+    deep_order: Option<Vec<String>>,
     default_extra_sources: Option<usize>,
     fallback_sources: Option<usize>,
     fetch_max_chars: Option<usize>,
     cache_size: Option<usize>,
     timeout_seconds: Option<u64>,
-    openai_compatible_api_url: Option<String>,
-    openai_compatible_api_key: Option<String>,
-    openai_compatible_model: Option<String>,
+    output_dir: Option<String>,
+    research_max_wait_seconds: Option<u64>,
+    grok_protocol: Option<String>,
     github_token: Option<String>,
     source_max_answers: Option<usize>,
     source_max_comments: Option<usize>,
@@ -285,8 +303,16 @@ impl ConfigFile {
         insert("EXA_API_KEY", self.exa_api_key);
         insert("EXA_ENABLED", self.exa_enabled.map(|b| b.to_string()));
         insert(
-            "GROK_SEARCH_SOURCE_PROVIDERS",
+            "LLM_SEARCH_SOURCE_PROVIDERS",
             self.source_providers.map(|list| list.join(",")),
+        );
+        insert(
+            "LLM_SEARCH_QUICK_ORDER",
+            self.quick_order.map(|list| list.join(",")),
+        );
+        insert(
+            "LLM_SEARCH_DEEP_ORDER",
+            self.deep_order.map(|list| list.join(",")),
         );
         insert(
             "GROK_SEARCH_EXTRA_SOURCES",
@@ -297,43 +323,46 @@ impl ConfigFile {
             self.fallback_sources.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_FETCH_MAX_CHARS",
+            "LLM_SEARCH_FETCH_MAX_CHARS",
             self.fetch_max_chars.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_CACHE_SIZE",
+            "LLM_SEARCH_CACHE_SIZE",
             self.cache_size.map(|n| n.to_string()),
         );
+        insert("LLM_SEARCH_OUTPUT_DIR", self.output_dir);
         insert(
-            "GROK_SEARCH_TIMEOUT_SECONDS",
+            "LLM_SEARCH_RESEARCH_MAX_WAIT_SECONDS",
+            self.research_max_wait_seconds.map(|n| n.to_string()),
+        );
+        insert(
+            "LLM_SEARCH_TIMEOUT_SECONDS",
             self.timeout_seconds.map(|n| n.to_string()),
         );
-        insert("OPENAI_COMPATIBLE_API_URL", self.openai_compatible_api_url);
-        insert("OPENAI_COMPATIBLE_API_KEY", self.openai_compatible_api_key);
-        insert("OPENAI_COMPATIBLE_MODEL", self.openai_compatible_model);
+        insert("GROK_SEARCH_PROTOCOL", self.grok_protocol);
         insert("GITHUB_TOKEN", self.github_token);
         insert(
-            "GROK_SEARCH_SOURCE_MAX_ANSWERS",
+            "LLM_SEARCH_SOURCE_MAX_ANSWERS",
             self.source_max_answers.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_SOURCE_MAX_COMMENTS",
+            "LLM_SEARCH_SOURCE_MAX_COMMENTS",
             self.source_max_comments.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_ENRICH_CONCURRENCY",
+            "LLM_SEARCH_ENRICH_CONCURRENCY",
             self.enrich_concurrency.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_ENRICH_MAX_CHARS",
+            "LLM_SEARCH_ENRICH_MAX_CHARS",
             self.enrich_max_chars.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_MAX_INLINE_SOURCES",
+            "LLM_SEARCH_MAX_INLINE_SOURCES",
             self.max_inline_sources.map(|n| n.to_string()),
         );
         insert(
-            "GROK_SEARCH_RESPONSE_MAX_CHARS",
+            "LLM_SEARCH_RESPONSE_MAX_CHARS",
             self.response_max_chars.map(|n| n.to_string()),
         );
         out
@@ -342,7 +371,7 @@ impl ConfigFile {
 
 impl Config {
     /// Load config with full precedence chain: process env > config file > defaults.
-    /// Config file path: `$GROK_SEARCH_CONFIG` if set, else
+    /// Config file path: `$LLM_SEARCH_CONFIG` if set, else
     /// `<home>/.config/grok-search-rs/config.toml`, where `<home>` is `$HOME`
     /// on Unix / Git Bash and `%USERPROFILE%` on native Windows shells.
     /// Missing or unparseable files are skipped silently (env-only mode).
@@ -424,8 +453,8 @@ impl Config {
                 "TAVILY_API_URL",
                 "https://api.tavily.com",
             )),
-            // Blank means absent, as it already does for the auth file and the
-            // OpenAI-compatible settings below. Kept as `Some("")` these build
+            // Blank means absent, as it already does for the auth file and
+            // GITHUB_TOKEN. Kept as `Some("")` these build
             // a provider that exists only to 401 on every call, which makes
             // `doctor` and every availability check report a source that is
             // configured when nothing can come of it. Trimmed, because a
@@ -466,32 +495,33 @@ impl Config {
                 .cloned()
                 .filter(|value| !value.trim().is_empty()),
             exa_enabled: bool_value(&map, "EXA_ENABLED", true),
-            source_providers: csv_list(&map, "GROK_SEARCH_SOURCE_PROVIDERS"),
+            source_providers: name_list(&map, "LLM_SEARCH_SOURCE_PROVIDERS"),
+            quick_order: name_list(&map, "LLM_SEARCH_QUICK_ORDER"),
+            deep_order: name_list(&map, "LLM_SEARCH_DEEP_ORDER"),
             default_extra_sources: usize_value(&map, "GROK_SEARCH_EXTRA_SOURCES", 3),
             fallback_sources: usize_value(&map, "GROK_SEARCH_FALLBACK_SOURCES", 5),
-            fetch_max_chars: optional_positive_usize(&map, "GROK_SEARCH_FETCH_MAX_CHARS"),
-            cache_size: usize_value(&map, "GROK_SEARCH_CACHE_SIZE", 256),
-            timeout: Duration::from_secs(u64_value(&map, "GROK_SEARCH_TIMEOUT_SECONDS", 60)),
-            openai_compatible_api_url: map
-                .get("OPENAI_COMPATIBLE_API_URL")
-                .cloned()
-                .filter(|v| !v.is_empty()),
-            openai_compatible_api_key: map
-                .get("OPENAI_COMPATIBLE_API_KEY")
-                .cloned()
-                .filter(|v| !v.is_empty()),
-            openai_compatible_model: map
-                .get("OPENAI_COMPATIBLE_MODEL")
-                .cloned()
-                .filter(|v| !v.is_empty()),
+            fetch_max_chars: optional_positive_usize(&map, "LLM_SEARCH_FETCH_MAX_CHARS"),
+            cache_size: usize_value(&map, "LLM_SEARCH_CACHE_SIZE", 256),
+            timeout: Duration::from_secs(u64_value(&map, "LLM_SEARCH_TIMEOUT_SECONDS", 60)),
+            output_dir: map
+                .get("LLM_SEARCH_OUTPUT_DIR")
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from),
+            write_crawl_files: true,
+            research_max_wait: map
+                .get("LLM_SEARCH_RESEARCH_MAX_WAIT_SECONDS")
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .filter(|seconds| *seconds > 0)
+                .map(Duration::from_secs),
             transport: decide_transport(&map, grok_auth_mode),
             github_token: map.get("GITHUB_TOKEN").cloned().filter(|v| !v.is_empty()),
-            source_max_answers: usize_value(&map, "GROK_SEARCH_SOURCE_MAX_ANSWERS", 5),
-            source_max_comments: usize_value(&map, "GROK_SEARCH_SOURCE_MAX_COMMENTS", 30),
-            enrich_concurrency: usize_value(&map, "GROK_SEARCH_ENRICH_CONCURRENCY", 3).clamp(1, 5),
-            enrich_max_chars: usize_value(&map, "GROK_SEARCH_ENRICH_MAX_CHARS", 15000),
-            max_inline_sources: usize_value(&map, "GROK_SEARCH_MAX_INLINE_SOURCES", 5),
-            response_max_chars: usize_value(&map, "GROK_SEARCH_RESPONSE_MAX_CHARS", 45_000),
+            source_max_answers: usize_value(&map, "LLM_SEARCH_SOURCE_MAX_ANSWERS", 5),
+            source_max_comments: usize_value(&map, "LLM_SEARCH_SOURCE_MAX_COMMENTS", 30),
+            enrich_concurrency: usize_value(&map, "LLM_SEARCH_ENRICH_CONCURRENCY", 3).clamp(1, 5),
+            enrich_max_chars: usize_value(&map, "LLM_SEARCH_ENRICH_MAX_CHARS", 15000),
+            max_inline_sources: usize_value(&map, "LLM_SEARCH_MAX_INLINE_SOURCES", 5),
+            response_max_chars: usize_value(&map, "LLM_SEARCH_RESPONSE_MAX_CHARS", 45_000),
             // This is the environment-only constructor; no file was consulted.
             // `load_from` overwrites both after merging one in.
             config_file_path: None,
@@ -522,7 +552,6 @@ impl Config {
             &self.firecrawl_api_key,
             &self.tinyfish_api_key,
             &self.exa_api_key,
-            &self.openai_compatible_api_key,
             &self.github_token,
         ]
         .into_iter()
@@ -566,7 +595,7 @@ impl Config {
 }
 
 fn resolve_config_path(env: &HashMap<String, String>) -> Option<PathBuf> {
-    if let Some(explicit) = env.get("GROK_SEARCH_CONFIG").filter(|v| !v.is_empty()) {
+    if let Some(explicit) = env.get("LLM_SEARCH_CONFIG").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(explicit));
     }
     let home = resolve_home_dir(env)?;
@@ -593,7 +622,7 @@ fn resolve_home_dir(env: &HashMap<String, String>) -> Option<PathBuf> {
 }
 
 /// Resolved config file path using process env. Precedence:
-/// 1. `$GROK_SEARCH_CONFIG` (any platform, explicit override)
+/// 1. `$LLM_SEARCH_CONFIG` (any platform, explicit override)
 /// 2. `$HOME/.config/grok-search-rs/config.toml` (Unix / Git Bash)
 /// 3. `%USERPROFILE%\.config\grok-search-rs\config.toml` (native Windows)
 ///
@@ -666,7 +695,7 @@ pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSear
 # Default path:
 #   Unix / macOS / Git Bash:   $HOME/.config/grok-search-rs/config.toml
 #   Windows (PowerShell/cmd):  %USERPROFILE%\.config\grok-search-rs\config.toml
-# Override anywhere with $GROK_SEARCH_CONFIG=/abs/path/to/config.toml
+# Override anywhere with $LLM_SEARCH_CONFIG=/abs/path/to/config.toml
 #
 # Precedence: process env > this file > built-in defaults.
 # All keys below are commented out; uncomment and fill what you need.
@@ -685,6 +714,9 @@ pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSear
 # grok_api_key   = "xai-..."          # xAI / Grok key   https://x.ai/api
 # grok_auth_mode = "api_key"          # api_key | oauth
 # grok_auth_file = "C:\\Users\\you\\.config\\grok-search-rs\\auth.json"
+# grok_protocol  = "responses"        # API format at grok_api_url:
+#                                     # responses (/v1/responses, default) |
+#                                     # chat_completions (/v1/chat/completions)
 
 # ── Common knobs ──────────────────────────────────────────────
 # grok_model         = "grok-4-1-fast-reasoning"
@@ -695,6 +727,10 @@ pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSear
 # source_providers   = ["tavily", "exa", "tinyfish", "firecrawl", "brave"]
 #                                     # explicit chain order; omit for the
 #                                     # built-in order over configured providers
+# quick_order        = ["brave", "tavily", "exa", "tinyfish", "firecrawl"]
+# deep_order         = ["tavily", "brave", "exa", "tinyfish", "firecrawl"]
+#                                     # web_search mode order (default shown);
+#                                     # unlisted providers follow in default order
 
 # ── Endpoints (only set when using a self-hosted gateway) ─────
 # grok_api_url            = "https://api.x.ai"
@@ -703,15 +739,6 @@ pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSear
 # tinyfish_search_api_url = "https://api.search.tinyfish.ai"
 # tinyfish_fetch_api_url  = "https://api.fetch.tinyfish.ai"
 # exa_api_url             = "https://api.exa.ai"
-
-# ── OpenAI-compatible transport (alternative to grok_*) ───────
-# Set these three to use a /v1/chat/completions gateway. When grok_api_key
-# above is also set, it wins; otherwise these three pick the chat-completions
-# transport. Source extraction supports OpenAI annotations, Perplexity-style
-# citations, marybrown's top-level search_sources, and inline [[n]](url).
-# openai_compatible_api_url = "https://your-gateway/v1"
-# openai_compatible_api_key = "sk-..."
-# openai_compatible_model   = "grok-4.3-fast"
 
 # ── Feature toggles ───────────────────────────────────────────
 # web_search_enabled = true
@@ -726,6 +753,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# llm-search global configuration (GrokSear
 # fetch_max_chars       = 200000      # per-request char cap on web_fetch
 # cache_size            = 256
 # timeout_seconds       = 60
+# output_dir            = "/abs/path"  # web_crawl result files (default: OS temp dir/llm-search)
+# research_max_wait_seconds = 900      # research wait limit (default mini 300, pro/auto 900)
 # source_max_answers    = 5          # max answers rendered per StackExchange question
 # source_max_comments   = 30         # max comments per accepted answer
 # github_token          = "ghp_..."  # GitHub token (optional; anon = 60 req/hr)
@@ -814,15 +843,21 @@ fn bool_value(map: &HashMap<String, String>, key: &str, default: bool) -> bool {
 
 /// Comma-separated list → trimmed, lowercased entries, de-duplicated with
 /// first occurrence winning. Absent/blank values yield an empty list.
-fn csv_list(map: &HashMap<String, String>, key: &str) -> Vec<String> {
+/// A provider-name list: `a,b,c` or `[a, b, c]` (quoted items allowed, as in
+/// `["a", "b"]`). Names are trimmed, lowercased, and deduplicated in order.
+fn name_list(map: &HashMap<String, String>, key: &str) -> Vec<String> {
+    let raw = map.get(key).map(String::as_str).unwrap_or_default().trim();
+    let raw = raw
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(raw);
     let mut names: Vec<String> = Vec::new();
-    for part in map
-        .get(key)
-        .map(String::as_str)
-        .unwrap_or_default()
-        .split(',')
-    {
-        let name = part.trim().to_ascii_lowercase();
+    for part in raw.split(',') {
+        let name = part
+            .trim()
+            .trim_matches(|c| c == '"' || c == '\'')
+            .trim()
+            .to_ascii_lowercase();
         if !name.is_empty() && !names.contains(&name) {
             names.push(name);
         }
@@ -890,30 +925,27 @@ fn optional_positive_usize(map: &HashMap<String, String>, key: &str) -> Option<u
         .filter(|value| *value > 0)
 }
 
+/// `GROK_SEARCH_PROTOCOL`: `responses` (default) or `chat_completions`. OAuth
+/// exists only for the Responses API, so it always selects `responses`.
+/// Unrecognized values log a warning and use `responses`.
 fn decide_transport(map: &HashMap<String, String>, auth_mode: AuthMode) -> Transport {
     if auth_mode == AuthMode::OAuth {
         return Transport::Responses;
     }
-    let grok_key_set = map
-        .get("GROK_SEARCH_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let compat_url_set = map
-        .get("OPENAI_COMPATIBLE_API_URL")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-    let compat_key_set = map
-        .get("OPENAI_COMPATIBLE_API_KEY")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
-
-    if grok_key_set {
-        return Transport::Responses;
+    let value = map
+        .get("GROK_SEARCH_PROTOCOL")
+        .map(|v| v.trim().to_ascii_lowercase())
+        .unwrap_or_default();
+    match value.as_str() {
+        "" | "responses" => Transport::Responses,
+        "chat_completions" => Transport::ChatCompletions,
+        other => {
+            eprintln!(
+                "llm-search: unknown GROK_SEARCH_PROTOCOL \"{other}\" (valid: responses, chat_completions); using responses"
+            );
+            Transport::Responses
+        }
     }
-    if compat_url_set && compat_key_set {
-        return Transport::ChatCompletions;
-    }
-    Transport::Responses
 }
 
 /// Two-state presence marker for a secret. Never emits any fragment of the
@@ -956,13 +988,13 @@ mod source_config_tests {
 
     #[test]
     fn source_max_answers_reads_env() {
-        let cfg = Config::from_env_map([("GROK_SEARCH_SOURCE_MAX_ANSWERS", "3")]);
+        let cfg = Config::from_env_map([("LLM_SEARCH_SOURCE_MAX_ANSWERS", "3")]);
         assert_eq!(cfg.source_max_answers, 3);
     }
 
     #[test]
     fn source_max_comments_reads_env() {
-        let cfg = Config::from_env_map([("GROK_SEARCH_SOURCE_MAX_COMMENTS", "10")]);
+        let cfg = Config::from_env_map([("LLM_SEARCH_SOURCE_MAX_COMMENTS", "10")]);
         assert_eq!(cfg.source_max_comments, 10);
     }
 
@@ -1003,17 +1035,9 @@ mod source_config_tests {
             ("GROK_SEARCH_API_KEY", "xai-secret"),
             ("TAVILY_API_KEY", "tvly-secret"),
             ("FIRECRAWL_API_KEY", "fc-secret"),
-            ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
-            ("OPENAI_COMPATIBLE_API_KEY", "sk-secret"),
         ]);
         let dbg = format!("{cfg:?}");
-        for leaked in [
-            "ghp_test",
-            "xai-secret",
-            "tvly-secret",
-            "fc-secret",
-            "sk-secret",
-        ] {
+        for leaked in ["ghp_test", "xai-secret", "tvly-secret", "fc-secret"] {
             assert!(
                 !dbg.contains(leaked),
                 "secret value {leaked} leaked into Debug output: {dbg}"
@@ -1039,7 +1063,7 @@ mod source_config_tests {
 
     #[test]
     fn enrich_concurrency_reads_env_and_clamps() {
-        let cfg = Config::from_env_map([("GROK_SEARCH_ENRICH_CONCURRENCY", "7")]);
+        let cfg = Config::from_env_map([("LLM_SEARCH_ENRICH_CONCURRENCY", "7")]);
         assert_eq!(cfg.enrich_concurrency, 5); // clamped to 1..=5
     }
 }
@@ -1049,44 +1073,33 @@ mod transport_field_tests {
     use super::*;
 
     #[test]
-    fn loads_openai_compatible_fields_from_env() {
-        let cfg = Config::from_env_map([
-            ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
-            ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
-            ("OPENAI_COMPATIBLE_MODEL", "grok-4.3-fast"),
-        ]);
-        assert_eq!(
-            cfg.openai_compatible_api_url.as_deref(),
-            Some("https://example.com/v1")
-        );
-        assert_eq!(cfg.openai_compatible_api_key.as_deref(), Some("sk-fake"));
-        assert_eq!(
-            cfg.openai_compatible_model.as_deref(),
-            Some("grok-4.3-fast")
-        );
-    }
-
-    #[test]
-    fn transport_defaults_to_responses_when_only_grok_set() {
+    fn protocol_defaults_to_responses() {
         let cfg = Config::from_env_map([("GROK_SEARCH_API_KEY", "xai-fake")]);
         assert_eq!(cfg.transport, Transport::Responses);
     }
 
     #[test]
-    fn transport_chat_completions_when_only_compat_set() {
+    fn protocol_selects_chat_completions() {
         let cfg = Config::from_env_map([
-            ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
-            ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
+            ("GROK_SEARCH_API_KEY", "sk-fake"),
+            ("GROK_SEARCH_URL", "https://gateway.example/v1"),
+            ("GROK_SEARCH_PROTOCOL", " Chat_Completions "),
         ]);
         assert_eq!(cfg.transport, Transport::ChatCompletions);
+        assert_eq!(cfg.grok_api_url, "https://gateway.example/v1");
     }
 
     #[test]
-    fn transport_prefers_grok_when_both_set() {
+    fn unknown_protocol_falls_back_to_responses() {
+        let cfg = Config::from_env_map([("GROK_SEARCH_PROTOCOL", "gemini")]);
+        assert_eq!(cfg.transport, Transport::Responses);
+    }
+
+    #[test]
+    fn oauth_forces_responses() {
         let cfg = Config::from_env_map([
-            ("GROK_SEARCH_API_KEY", "xai-fake"),
-            ("OPENAI_COMPATIBLE_API_URL", "https://example.com/v1"),
-            ("OPENAI_COMPATIBLE_API_KEY", "sk-fake"),
+            ("GROK_SEARCH_AUTH_MODE", "oauth"),
+            ("GROK_SEARCH_PROTOCOL", "chat_completions"),
         ]);
         assert_eq!(cfg.transport, Transport::Responses);
     }

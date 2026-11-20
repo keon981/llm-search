@@ -76,14 +76,15 @@ fn tavily_map_request_uses_limit_not_max_results() {
     let body = tavily_map_request_body("https://openai.com/news/", 5);
 
     assert_eq!(body["url"], "https://openai.com/news/");
-    assert_eq!(body["max_depth"], 1);
+    // Depth is left to Tavily's default (1).
+    assert!(body.get("max_depth").is_none());
     assert_eq!(body["limit"], 5);
     assert!(body.get("max_results").is_none());
 }
 
 #[test]
 fn tavily_search_body_omits_filters_when_empty() {
-    let body = tavily_search_request_body("rust async", 4, &SearchFilters::default());
+    let body = tavily_search_request_body("rust async", 4, &SearchFilters::default(), 0);
 
     assert_eq!(body["query"], "rust async");
     assert_eq!(body["max_results"], 4);
@@ -100,12 +101,16 @@ fn tavily_search_body_serializes_filters() {
         recency_days: Some(3),
         include_domains: vec!["github.com".to_string(), "news.ycombinator.com".to_string()],
         exclude_domains: vec!["example.com".to_string()],
+        ..SearchFilters::default()
     };
 
-    let body = tavily_search_request_body("today AI", 5, &filters);
+    // 2026-11-03T04:05:06Z
+    let body = tavily_search_request_body("today AI", 5, &filters, 1_793_678_706);
 
-    assert_eq!(body["days"], 3);
-    assert_eq!(body["topic"], "news");
+    // recency_days is a start date, never the legacy `days` + `topic=news`.
+    assert_eq!(body["start_date"], "2026-10-31");
+    assert!(body.get("days").is_none());
+    assert!(body.get("topic").is_none());
     assert_eq!(
         body["include_domains"],
         serde_json::json!(["github.com", "news.ycombinator.com"])
